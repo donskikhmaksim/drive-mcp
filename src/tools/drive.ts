@@ -456,4 +456,107 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
       }
     }),
   );
+
+  // ── Permissions ───────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "drive_get_permissions",
+    {
+      title: "Get file permissions",
+      description: "List all sharing permissions (who has access) for a Drive file or folder.",
+      inputSchema: {
+        account,
+        fileId: z.string().describe("File or folder ID."),
+      },
+    },
+    guard(async ({ account, fileId }) => {
+      const g = clients.resolve(account);
+      const res = await g.drive.permissions.list({
+        fileId,
+        fields: "permissions(id,type,role,emailAddress,displayName,domain,expirationTime)",
+      });
+      const permissions = res.data.permissions ?? [];
+      return ok({
+        summary: `🔐 ${permissions.length} permission(s) on ${fileId}`,
+        fileId,
+        permissions,
+      });
+    }),
+  );
+
+  server.registerTool(
+    "drive_share",
+    {
+      title: "Share file / set permission",
+      description:
+        "Share a Drive file or folder with a user, group, domain, or make it public. " +
+        "Use role='reader'|'commenter'|'writer'|'fileOrganizer'|'organizer'|'owner'. " +
+        "Set sendNotificationEmail=false to share silently.",
+      inputSchema: {
+        account,
+        fileId: z.string().describe("File or folder ID."),
+        role: z.enum(["reader", "commenter", "writer", "fileOrganizer", "organizer", "owner"])
+          .describe("Access level to grant."),
+        type: z.enum(["user", "group", "domain", "anyone"])
+          .describe("Who to grant access to."),
+        emailAddress: z.string().optional()
+          .describe("Email of the user or group (required when type=user or group)."),
+        domain: z.string().optional()
+          .describe("Domain name (required when type=domain, e.g. 'example.com')."),
+        sendNotificationEmail: z.boolean().default(false).optional()
+          .describe("Send email notification to the recipient (default: false)."),
+        emailMessage: z.string().optional()
+          .describe("Custom message to include in the notification email."),
+        transferOwnership: z.boolean().default(false).optional()
+          .describe("Transfer ownership (only for role=owner, same domain)."),
+      },
+    },
+    guard(async ({ account, fileId, role, type, emailAddress, domain, sendNotificationEmail, emailMessage, transferOwnership }) => {
+      if ((type === "user" || type === "group") && !emailAddress) {
+        return fail(`emailAddress is required when type="${type}".`);
+      }
+      if (type === "domain" && !domain) {
+        return fail(`domain is required when type="domain".`);
+      }
+      const g = clients.resolve(account);
+      const res = await g.drive.permissions.create({
+        fileId,
+        sendNotificationEmail: sendNotificationEmail ?? false,
+        emailMessage,
+        transferOwnership: transferOwnership ?? false,
+        requestBody: { role, type, emailAddress, domain },
+        fields: "id,role,type,emailAddress,displayName",
+      });
+      return ok({
+        summary: `✅ Shared — role=${res.data.role}, type=${res.data.type}${res.data.emailAddress ? ` (${res.data.emailAddress})` : ""}`,
+        permissionId: res.data.id,
+        role: res.data.role,
+        type: res.data.type,
+        emailAddress: res.data.emailAddress,
+        displayName: res.data.displayName,
+      });
+    }),
+  );
+
+  server.registerTool(
+    "drive_unshare",
+    {
+      title: "Remove permission",
+      description: "Remove a sharing permission from a Drive file or folder. Use drive_get_permissions to find the permissionId.",
+      inputSchema: {
+        account,
+        fileId: z.string().describe("File or folder ID."),
+        permissionId: z.string().describe("Permission ID to remove (from drive_get_permissions)."),
+      },
+    },
+    guard(async ({ account, fileId, permissionId }) => {
+      const g = clients.resolve(account);
+      await g.drive.permissions.delete({ fileId, permissionId });
+      return ok({
+        summary: `🔒 Removed permission ${permissionId} from ${fileId}`,
+        fileId,
+        permissionId,
+      });
+    }),
+  );
 }
