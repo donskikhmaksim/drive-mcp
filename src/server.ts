@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { User } from "./config.js";
-import { buildUserClients } from "./accounts.js";
+import { buildUserClients, registerAccountTools } from "./accounts.js";
 import { registerDriveTools } from "./tools/drive.js";
 import { registerSkillVersionTools } from "./tools/skill_version.js";
 
@@ -14,6 +14,7 @@ export function buildMcpServer(user: User): McpServer {
     { name: "drive-mcp", version: "1.0.0" },
     { instructions: "Tools to organise Google Drive: search, upload, download, move, rename, trash files and folders. " + accountsHint },
   );
+  registerAccountTools(server, clients);
   registerDriveTools(server, clients);
   registerSkillVersionTools(server, clients);
   return server;
