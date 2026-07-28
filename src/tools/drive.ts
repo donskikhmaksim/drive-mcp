@@ -11,6 +11,26 @@ import { documentToPlainText } from "./docs.js";
 
 const GOOGLE_DOC_MIME = "application/vnd.google-apps.document";
 
+/** Raw Drive upload endpoint (resumable sessions bypass the googleapis client). */
+const UPLOAD_ENDPOINT = "https://www.googleapis.com/upload/drive/v3/files";
+
+/** Metadata Google echoes back when a resumable upload finalises. */
+const UPLOAD_FIELDS = "id,name,mimeType,size,webViewLink";
+
+/** Default content type for uploads when the caller does not specify one. */
+const DEFAULT_UPLOAD_MIME = "application/octet-stream";
+
+/** Read an error response body, trimmed so a huge HTML page cannot flood the result. */
+async function errorBody(res: Response): Promise<string> {
+  let text: string;
+  try {
+    text = await res.text();
+  } catch {
+    return "<unreadable body>";
+  }
+  return text.length > 500 ? `${text.slice(0, 500)}… (truncated)` : text;
+}
+
 /** Default export format for Google-native files when none is given. */
 function defaultExportMime(mime: string): string {
   if (mime === "application/vnd.google-apps.document") return "text/plain";
@@ -346,25 +366,47 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
         "that URL — the server never proxies the file, so nothing large travels through the " +
         "tool-call body. Use this for files bigger than ~1 MB, where drive_upload_file is not " +
         "usable (there the whole content is sent as base64 inside the call). Each session URI " +
-        "stays valid for up to ~1 week. After the bytes are uploaded, call drive_confirm_upload " +
-        "with the same uploadUrl to check status and get the final fileId.",
+        "stays valid for about a week (see the machine-readable `expiresAt`). Pass `fileId` to " +
+        "replace the content of an existing file instead of creating a new one. After the bytes " +
+        "are uploaded, call drive_confirm_upload with the same uploadUrl to check status and get " +
+        "the final fileId. Every result carries a `howTo` string with the exact PUT headers.",
       inputSchema: {
         account,
         files: z
           .array(
             z.object({
-              name: z.string().describe("File name, e.g. 'video.mp4'."),
+              name: z
+                .string()
+                .optional()
+                .describe(
+                  "File name, e.g. 'video.mp4'. Required for a new file; with `fileId` it renames " +
+                    "the file — omit it to keep the current name.",
+                ),
               mimeType: z
                 .string()
                 .optional()
-                .describe("Content type of the bytes the client will upload. Default octet-stream."),
-              fileSize: z
+                .describe(
+                  `Content type of the bytes the client will upload. Default ${DEFAULT_UPLOAD_MIME}.`,
+                ),
+              sizeBytes: z
                 .number()
                 .int()
                 .positive()
                 .optional()
-                .describe("Total size in bytes, if known. Lets Google validate the upload."),
-              parentId: z.string().optional().describe("Destination folder id."),
+                .describe(
+                  "Total size in bytes, if known. Lets Google validate the upload; when omitted " +
+                    "the client must send '*' as the total until the final chunk.",
+                ),
+              parentId: z
+                .string()
+                .optional()
+                .describe("Destination folder id (new files only; use drive_move to reparent)."),
+              fileId: z
+                .string()
+                .optional()
+                .describe(
+                  "Id of an existing file to REPLACE (destructive: the previous content is lost).",
+                ),
             }),
           )
           .min(1)
@@ -377,51 +419,76 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
       const token = await g.accessToken();
       const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
       const results = await Promise.all(
-        files.map(async ({ name, mimeType, fileSize, parentId }) => {
+        files.map(async ({ name, mimeType, sizeBytes, parentId, fileId }) => {
+          const label = name ?? fileId ?? null;
           try {
-            const res = await fetch(
-              "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true",
-              {
-                method: "POST",
-                headers: {
-                  Authorization: `Bearer ${token}`,
-                  "Content-Type": "application/json; charset=UTF-8",
-                  "X-Upload-Content-Type": mimeType ?? "application/octet-stream",
-                  ...(fileSize ? { "X-Upload-Content-Length": String(fileSize) } : {}),
-                },
-                body: JSON.stringify({
-                  name,
-                  parents: parentId ? [parentId] : undefined,
-                }),
+            if (!name && !fileId) {
+              return { name: label, error: "Provide `name` (new file) or `fileId` (replace)." };
+            }
+            if (fileId && parentId) {
+              return {
+                name: label,
+                error: "parentId cannot be combined with fileId — use drive_move to reparent.",
+              };
+            }
+            const resolvedMime = mimeType ?? DEFAULT_UPLOAD_MIME;
+            const url =
+              `${UPLOAD_ENDPOINT}${fileId ? `/${encodeURIComponent(fileId)}` : ""}` +
+              `?uploadType=resumable&supportsAllDrives=true` +
+              `&fields=${encodeURIComponent(UPLOAD_FIELDS)}`;
+            const metadata: Record<string, unknown> = {};
+            if (name) metadata.name = name;
+            if (!fileId && parentId) metadata.parents = [parentId];
+
+            const res = await fetch(url, {
+              method: fileId ? "PATCH" : "POST",
+              headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json; charset=UTF-8",
+                "X-Upload-Content-Type": resolvedMime,
+                ...(sizeBytes ? { "X-Upload-Content-Length": String(sizeBytes) } : {}),
               },
-            );
+              body: JSON.stringify(metadata),
+            });
             if (!res.ok) {
-              return { name, error: `Google returned ${res.status}: ${await res.text()}` };
+              return { name: label, error: `Google returned ${res.status}: ${await errorBody(res)}` };
             }
             const uploadUrl = res.headers.get("location");
             if (!uploadUrl) {
               return {
-                name,
+                name: label,
                 error: "Google did not return a resumable session URI (no Location header).",
               };
             }
+            const total = sizeBytes ? String(sizeBytes) : "*";
+            const lastByte = sizeBytes ? String(sizeBytes - 1) : "<end>";
+            const howTo =
+              `PUT the raw bytes to uploadUrl with headers "Content-Type: ${resolvedMime}" and ` +
+              `"Content-Range: bytes 0-${lastByte}/${total}"` +
+              (sizeBytes
+                ? " (a single PUT of the whole file is fine). "
+                : " — the total size is unknown, so keep sending '*' as the total and put the " +
+                  "real total in the Content-Range of the FINAL chunk to finalise the upload. ") +
+              "Then call drive_confirm_upload with the same uploadUrl.";
             return {
-              name,
+              name: name ?? null,
+              fileId: fileId ?? null,
+              mode: fileId ? ("replace" as const) : ("create" as const),
               uploadUrl,
-              mimeType: mimeType ?? "application/octet-stream",
-              fileSize: fileSize ?? null,
+              mimeType: resolvedMime,
+              sizeBytes: sizeBytes ?? null,
               expiresAt,
+              howTo,
             };
           } catch (e: unknown) {
-            return { name, error: e instanceof Error ? e.message : String(e) };
+            return { name: label, error: e instanceof Error ? e.message : String(e) };
           }
         }),
       );
       return ok({
         summary:
           `⬆️ Created ${files.length} resumable upload session(s). ` +
-          "Client must PUT the raw file bytes to uploadUrl " +
-          "(headers: Content-Length: <size>, Content-Type: <mimeType>), " +
+          "Client must PUT the raw file bytes to uploadUrl (see `howTo` per file), " +
           "then call drive_confirm_upload.",
         results,
       });
@@ -437,8 +504,9 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
       description:
         "Query the status of one or more resumable upload sessions created by " +
         "drive_create_upload_session. If the upload finished, returns the final fileId together " +
-        "with the file name and webViewLink. If it is still incomplete, reports how many bytes " +
-        "Google has already accepted so the client can resume from that offset.",
+        "with the file name, mimeType and webViewLink. If it is still incomplete, reports how many " +
+        "bytes Google has already accepted so the client can resume from that offset. A session " +
+        "that Google no longer knows about (404/410 Gone) comes back as status='expired'.",
       inputSchema: {
         account,
         sessions: z
@@ -447,7 +515,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
               uploadUrl: z
                 .string()
                 .describe("The resumable session URI returned by drive_create_upload_session."),
-              fileSize: z
+              sizeBytes: z
                 .number()
                 .int()
                 .positive()
@@ -463,45 +531,51 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
     guard(async ({ account, sessions }) => {
       const g = clients.resolve(account);
       const results = await Promise.all(
-        sessions.map(async ({ uploadUrl, fileSize }) => {
+        sessions.map(async ({ uploadUrl, sizeBytes }) => {
           try {
             // A zero-length PUT with "bytes */<total>" asks Google for the current status;
             // the session URI itself carries the upload_id, so no Authorization is needed.
             const res = await fetch(uploadUrl, {
               method: "PUT",
               headers: {
-                "Content-Range": `bytes */${fileSize ?? "*"}`,
+                "Content-Range": `bytes */${sizeBytes ?? "*"}`,
                 "Content-Length": "0",
               },
             });
 
             if (res.status === 200 || res.status === 201) {
+              // The session was created with `fields=`, so the finalising response already
+              // carries the metadata — no extra files.get in the common case.
               let fileId: string | null = null;
               let name: string | null = null;
               let mimeType: string | null = null;
+              let size: string | null = null;
+              let webViewLink: string | null = null;
               try {
                 const body = (await res.json()) as {
                   id?: string;
                   name?: string;
                   mimeType?: string;
+                  size?: string;
+                  webViewLink?: string;
                 };
                 fileId = body.id ?? null;
                 name = body.name ?? null;
                 mimeType = body.mimeType ?? null;
+                size = body.size ?? null;
+                webViewLink = body.webViewLink ?? null;
               } catch {
                 /* body may be empty — fall back to metadata below */
               }
-              let size: string | null = null;
-              let webViewLink: string | null = null;
-              if (fileId) {
+              if (fileId && !webViewLink) {
                 try {
                   const meta = await g.drive.files.get({
                     fileId,
-                    fields: "id,name,mimeType,size,webViewLink",
+                    fields: UPLOAD_FIELDS,
                   });
                   name = meta.data.name ?? name;
                   mimeType = meta.data.mimeType ?? mimeType;
-                  size = meta.data.size ?? null;
+                  size = meta.data.size ?? size;
                   webViewLink = meta.data.webViewLink ?? null;
                 } catch {
                   /* metadata lookup is best-effort — return what we already have */
@@ -530,7 +604,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
                 nextOffset: bytesReceived,
                 hint:
                   "Client should PUT the remaining bytes with " +
-                  "Content-Range: bytes <nextOffset>-<end>/<total>.",
+                  `Content-Range: bytes <nextOffset>-<end>/${sizeBytes ?? "<total>"}.`,
               };
             }
 
@@ -543,7 +617,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
               };
             }
 
-            return { uploadUrl, error: `Google returned ${res.status}: ${await res.text()}` };
+            return { uploadUrl, error: `Google returned ${res.status}: ${await errorBody(res)}` };
           } catch (e: unknown) {
             return { uploadUrl, error: e instanceof Error ? e.message : String(e) };
           }

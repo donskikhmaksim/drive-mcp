@@ -80,7 +80,7 @@ calls.length = 0;
 responder = () =>
   res({ status: 200, headers: { location: "https://www.googleapis.com/upload/drive/v3/files?upload_id=SESSION1" } });
 let out = await call("drive_create_upload_session", {
-  files: [{ name: "holiday.mp4", mimeType: "video/mp4", fileSize: 734003200, parentId: "FOLDER1" }],
+  files: [{ name: "holiday.mp4", mimeType: "video/mp4", sizeBytes: 734003200, parentId: "FOLDER1" }],
 });
 let req = calls[0];
 check(
@@ -95,6 +95,13 @@ check("X-Upload-Content-Length", req.headers["X-Upload-Content-Length"] === "734
 check("metadata carries name + parent", req.body === JSON.stringify({ name: "holiday.mp4", parents: ["FOLDER1"] }), req.body);
 check("uploadUrl returned to the caller", out.results[0].uploadUrl.includes("upload_id=SESSION1"), JSON.stringify(out.results[0]));
 check("expiry advertised", typeof out.results[0].expiresAt === "string", String(out.results[0].expiresAt));
+check("metadata fields requested up front", /[?&]fields=/.test(req.url), req.url);
+check("mode = create", out.results[0].mode === "create", String(out.results[0].mode));
+check(
+  "howTo spells out the byte range",
+  out.results[0].howTo?.includes("Content-Range: bytes 0-734003199/734003200"),
+  String(out.results[0].howTo),
+);
 
 console.log("\n[3] create session — minimal arguments");
 calls.length = 0;
@@ -102,11 +109,29 @@ out = await call("drive_create_upload_session", { files: [{ name: "notes.bin" }]
 req = calls[0];
 check("defaults to octet-stream", req.headers["X-Upload-Content-Type"] === "application/octet-stream", req.headers["X-Upload-Content-Type"]);
 check("no size header when size unknown", req.headers["X-Upload-Content-Length"] === undefined, String(req.headers["X-Upload-Content-Length"]));
-check("fileSize reported as null", out.results[0].fileSize === null, String(out.results[0].fileSize));
+check("sizeBytes reported as null", out.results[0].sizeBytes === null, String(out.results[0].sizeBytes));
+check(
+  "howTo falls back to an unknown total",
+  out.results[0].howTo?.includes("Content-Range: bytes 0-<end>/*"),
+  String(out.results[0].howTo),
+);
+
+console.log("\n[3b] create session — replacing an existing file");
+calls.length = 0;
+responder = () => res({ status: 200, headers: { location: "https://upload/REPLACE" } });
+out = await call("drive_create_upload_session", { files: [{ fileId: "OLDID" }] });
+req = calls[0];
+check("PATCH on the existing file", req.method === "PATCH" && req.url.includes("/files/OLDID"), `${req.method} ${req.url}`);
+check("no metadata changes when only fileId is given", req.body === "{}", String(req.body));
+check("mode = replace", out.results[0].mode === "replace", String(out.results[0].mode));
+out = await call("drive_create_upload_session", { files: [{ fileId: "OLDID", parentId: "FOLDER1" }] });
+check("parentId + fileId rejected", /parentId cannot be combined/.test(out.results[0].error ?? ""), JSON.stringify(out.results[0]));
+out = await call("drive_create_upload_session", { files: [{ mimeType: "text/plain" }] });
+check("neither name nor fileId rejected", /Provide `name`/.test(out.results[0].error ?? ""), JSON.stringify(out.results[0]));
 
 console.log("\n[4] create session — Drive refuses");
 responder = () => res({ status: 403, body: '{"error":{"message":"storageQuotaExceeded"}}' });
-out = await call("drive_create_upload_session", { files: [{ name: "big.bin", fileSize: 99 }] });
+out = await call("drive_create_upload_session", { files: [{ name: "big.bin", sizeBytes: 99 }] });
 check("HTTP status surfaced", /403/.test(out.results[0].error ?? ""), JSON.stringify(out.results[0]));
 check("quota reason kept", /storageQuotaExceeded/.test(out.results[0].error ?? ""), JSON.stringify(out.results[0]));
 
@@ -129,7 +154,7 @@ check("bad file isolated to its own error", /500/.test(out.results[1].error ?? "
 console.log("\n[7] confirm — upload still in progress");
 calls.length = 0;
 responder = () => res({ status: 308, headers: { range: "bytes=0-524287" } });
-out = await call("drive_confirm_upload", { sessions: [{ uploadUrl: "https://upload/S1", fileSize: 1000000 }] });
+out = await call("drive_confirm_upload", { sessions: [{ uploadUrl: "https://upload/S1", sizeBytes: 1000000 }] });
 req = calls[0];
 check("status query is a PUT", req.method === "PUT", req.method);
 check("Content-Range asks for status", req.headers["Content-Range"] === "bytes */1000000", req.headers["Content-Range"]);
