@@ -9,6 +9,11 @@ const GOOGLE_SCOPES = [
 export interface GoogleClients {
   docs: docs_v1.Docs;
   drive: drive_v3.Drive;
+  /**
+   * A fresh OAuth access token for raw HTTP calls that bypass the googleapis
+   * client (e.g. Drive resumable uploads). Works for both auth modes.
+   */
+  accessToken(): Promise<string>;
 }
 
 function buildAuthClient(auth: GoogleAuthConfig) {
@@ -25,8 +30,19 @@ function buildAuthClient(auth: GoogleAuthConfig) {
 
 export function createGoogleClients(authConfig: GoogleAuthConfig): GoogleClients {
   const auth = buildAuthClient(authConfig);
+
+  // OAuth2Client resolves to `{ token }`, GoogleAuth resolves to a plain string.
+  async function accessToken(): Promise<string> {
+    const t: string | { token?: string | null } | null | undefined =
+      await auth.getAccessToken();
+    const token = typeof t === "string" ? t : t?.token;
+    if (!token) throw new Error("Failed to obtain a Google access token.");
+    return token;
+  }
+
   return {
     docs: google.docs({ version: "v1", auth }),
     drive: google.drive({ version: "v3", auth }),
+    accessToken,
   };
 }
