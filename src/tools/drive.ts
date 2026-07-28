@@ -8,6 +8,12 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ok, fail, guard, isTextual } from "../util.js";
 import { accountField, type UserClients } from "../accounts.js";
 import { documentToPlainText } from "./docs.js";
+import {
+  issueDownloadLink,
+  downloadsAvailable,
+  DEFAULT_TTL_MINUTES,
+  MAX_TTL_MINUTES,
+} from "../downloads.js";
 
 const GOOGLE_DOC_MIME = "application/vnd.google-apps.document";
 
@@ -36,6 +42,26 @@ function defaultExportMime(mime: string): string {
   if (mime === "application/vnd.google-apps.document") return "text/plain";
   if (mime === "application/vnd.google-apps.spreadsheet") return "text/csv";
   return "application/pdf";
+}
+
+const EXPORT_EXTENSIONS: Record<string, string> = {
+  "text/plain": ".txt",
+  "text/csv": ".csv",
+  "text/html": ".html",
+  "application/pdf": ".pdf",
+  "application/rtf": ".rtf",
+  "application/zip": ".zip",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+  "application/vnd.oasis.opendocument.text": ".odt",
+};
+
+/** Google-native files carry no extension — add the exported format's own. */
+function withExportExtension(name: string, exportMime: string): string {
+  const ext = EXPORT_EXTENSIONS[exportMime];
+  if (!ext || name.toLowerCase().endsWith(ext)) return name;
+  return name + ext;
 }
 
 export function registerDriveTools(server: McpServer, clients: UserClients) {
@@ -695,7 +721,9 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
       title: "Download / read Drive files",
       description:
         "Read one or more Drive files' content. Text files are returned as text; Google Docs/Sheets/Slides are exported " +
-        "(default: doc→text, sheet→csv, else pdf); other binaries are returned as base64 (size-limited).",
+        "(default: doc→text, sheet→csv, else pdf); other binaries are returned as base64 (size-limited). " +
+        "Use this when the CONTENT itself is needed in the conversation. When the user just wants the file " +
+        "(big, binary, or to keep), use drive_get_download_url so the client fetches it directly.",
       inputSchema: {
         account,
         files: z
@@ -776,6 +804,101 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
       return ok({
         summary: `⬇️ Downloaded ${files.length} file(s)`,
         results,
+      });
+    }),
+  );
+
+  // ── Download links (client fetches the bytes itself) ───────────────────────
+
+  server.registerTool(
+    "drive_get_download_url",
+    {
+      title: "Get a temporary download link",
+      description:
+        "Return a temporary download link per file so the client (phone, browser, script) can fetch the bytes " +
+        "directly, instead of drive_download_file inlining them into this conversation. Use it for anything large " +
+        "or binary, or whenever the user wants to keep the file rather than read its content here. " +
+        "Google-native files (Docs/Sheets/Slides) are exported on the fly — default doc→text, sheet→csv, else pdf; " +
+        "override with exportMimeType. " +
+        "The link IS the credential: anyone holding it can fetch that one file until it expires " +
+        `(default ${DEFAULT_TTL_MINUTES} minutes, max ${MAX_TTL_MINUTES / 60} hours), so pass it only to the person who asked. ` +
+        "It grants access to that single file and nothing else.",
+      inputSchema: {
+        account,
+        files: z
+          .array(
+            z.object({
+              fileId: z.string(),
+              exportMimeType: z
+                .string()
+                .optional()
+                .describe("Override export format for Google-native files, e.g. 'application/pdf'."),
+            }),
+          )
+          .min(1)
+          .describe("Array of files to build links for."),
+        ttlMinutes: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_TTL_MINUTES)
+          .optional()
+          .describe(`How long each link stays valid. Default ${DEFAULT_TTL_MINUTES} minutes.`),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    guard(async ({ account, files, ttlMinutes }) => {
+      if (!downloadsAvailable()) {
+        return fail(
+          "Download links are unavailable: this server does not know its own public URL. " +
+            "Set PUBLIC_BASE_URL (on Railway, turn on public networking). " +
+            "drive_download_file still works for small files.",
+        );
+      }
+      const g = clients.resolve(account);
+      const results = await Promise.all(
+        files.map(async ({ fileId, exportMimeType }) => {
+          try {
+            const meta = await g.drive.files.get({
+              fileId,
+              fields: "id,name,mimeType,size",
+              supportsAllDrives: true,
+            });
+            const mime = meta.data.mimeType ?? "application/octet-stream";
+            const isNative = mime.startsWith("application/vnd.google-apps.");
+            const exportMime = isNative ? exportMimeType ?? defaultExportMime(mime) : undefined;
+            const name = exportMime
+              ? withExportExtension(meta.data.name ?? "file", exportMime)
+              : meta.data.name ?? "file";
+            const { url, expiresAt } = await issueDownloadLink(
+              {
+                account: account ?? clients.defaultName,
+                fileId,
+                exportMime,
+                name,
+                mimeType: exportMime ?? mime,
+                size: meta.data.size ? Number(meta.data.size) : undefined,
+              },
+              ttlMinutes ?? DEFAULT_TTL_MINUTES,
+            );
+            return {
+              fileId,
+              name,
+              mimeType: exportMime ?? mime,
+              // Exports are generated on the fly, so their size is unknown up front.
+              size: exportMime ? null : meta.data.size ?? null,
+              downloadUrl: url,
+              expiresAt,
+            };
+          } catch (e: unknown) {
+            return { fileId, error: e instanceof Error ? e.message : String(e) };
+          }
+        }),
+      );
+      return ok({
+        summary: `🔗 Built ${files.length} download link(s)`,
+        results,
+        note: "Each link works without any further sign-in until it expires — treat it as a password for that one file.",
       });
     }),
   );

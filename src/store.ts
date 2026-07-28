@@ -15,6 +15,11 @@ function getPool(): pg.Pool {
   return pool;
 }
 
+/** True when a database is configured — otherwise callers fall back to memory. */
+export function storeReady(): boolean {
+  return !!pool;
+}
+
 export async function ensureSchema(): Promise<void> {
   const p = getPool();
   // Legacy single-account table (one row, id=1). Kept only so existing
@@ -99,6 +104,67 @@ export async function ensureSchema(): Promise<void> {
       created_at     TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  // Short-lived download links handed to a client so it can fetch a file's
+  // bytes itself (see downloads.ts). Rows are disposable — dropping the table
+  // only invalidates links that were already about to expire.
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS download_tokens (
+      token        TEXT PRIMARY KEY,
+      account      TEXT NOT NULL,
+      file_id      TEXT NOT NULL,
+      export_mime  TEXT,
+      name         TEXT NOT NULL,
+      mime_type    TEXT NOT NULL,
+      size         BIGINT,
+      expires_at   BIGINT NOT NULL,
+      created_at   TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+}
+
+// ---- Download links ----
+
+export interface DownloadTarget {
+  /** Account label the file belongs to — resolved again when the link is used. */
+  account: string;
+  fileId: string;
+  /** Export format for Google-native files; unset means "download the bytes as-is". */
+  exportMime?: string;
+  name: string;
+  mimeType: string;
+  size?: number;
+  expiresAt: number;
+}
+
+export async function saveDownloadToken(token: string, t: DownloadTarget): Promise<void> {
+  const p = getPool();
+  // Opportunistic cleanup — expired links are worthless, nothing waits on this.
+  await p.query(`DELETE FROM download_tokens WHERE expires_at < $1`, [Date.now()]);
+  await p.query(
+    `INSERT INTO download_tokens (token, account, file_id, export_mime, name, mime_type, size, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [token, t.account, t.fileId, t.exportMime ?? null, t.name, t.mimeType, t.size ?? null, t.expiresAt],
+  );
+}
+
+/** Returns the target for a still-valid token, or null when unknown/expired. */
+export async function getDownloadToken(token: string): Promise<DownloadTarget | null> {
+  const p = getPool();
+  const res = await p.query(`SELECT * FROM download_tokens WHERE token = $1 AND expires_at > $2`, [
+    token,
+    Date.now(),
+  ]);
+  if (!res.rows.length) return null;
+  const row = res.rows[0];
+  return {
+    account: row.account,
+    fileId: row.file_id,
+    exportMime: row.export_mime ?? undefined,
+    name: row.name,
+    mimeType: row.mime_type,
+    size: row.size === null ? undefined : Number(row.size),
+    expiresAt: Number(row.expires_at),
+  };
 }
 
 // ---- Google accounts (multi-account, one owner per instance) ----

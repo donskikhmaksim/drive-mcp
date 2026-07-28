@@ -14,6 +14,8 @@ import {
   renameAccount,
 } from "./store.js";
 import { renderDashboard } from "./dashboard.js";
+import { initDownloads, resolveDownloadLink } from "./downloads.js";
+import { buildUserClients } from "./accounts.js";
 
 const JSONRPC_UNAUTHORIZED = {
   jsonrpc: "2.0" as const,
@@ -66,6 +68,15 @@ async function userFromGoogleAccounts(config: Config): Promise<User | null> {
   };
 }
 
+/**
+ * Content-Disposition that survives non-ASCII names: a sanitised fallback for
+ * old clients plus the RFC 5987 UTF-8 form modern ones prefer.
+ */
+function contentDisposition(name: string): string {
+  const ascii = name.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_");
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+}
+
 /** Constant-time compare for the dashboard path secret. */
 function secretMatches(provided: string, expected: string): boolean {
   const a = Buffer.from(provided);
@@ -87,6 +98,64 @@ export async function startHttpServer(config: Config): Promise<void> {
     res.json({ status: "ok", endpoint: "/mcp" });
   });
   app.get("/health", (_req, res) => res.json({ status: "ok" }));
+
+  initDownloads(config.onboarding.publicBaseUrl);
+
+  // ---- Temporary download links minted by drive_get_download_url ----
+  // Deliberately unauthenticated: the unguessable, expiring token in the path
+  // IS the credential, and it authorises exactly one file. See downloads.ts.
+  app.get("/dl/:token", async (req: Request, res: Response) => {
+    const target = await resolveDownloadLink(String(req.params.token));
+    if (!target) {
+      res.status(404).type("text/plain").send("This download link is invalid or has expired.");
+      return;
+    }
+    const user = (await userFromGoogleAccounts(config)) ?? config.users[0] ?? null;
+    if (!user) {
+      res.status(503).type("text/plain").send("No Google account is linked to this server any more.");
+      return;
+    }
+    try {
+      const g = buildUserClients(user).resolve(target.account);
+      // Pass the client's Range through so big downloads can resume.
+      const range = req.header("range");
+      const options = {
+        responseType: "stream" as const,
+        headers: range ? { Range: range } : undefined,
+      };
+      const gres = target.exportMime
+        ? await g.drive.files.export({ fileId: target.fileId, mimeType: target.exportMime }, options)
+        : await g.drive.files.get(
+            { fileId: target.fileId, alt: "media", supportsAllDrives: true },
+            options,
+          );
+
+      res.status(gres.status === 206 ? 206 : 200);
+      res.setHeader("Content-Type", target.mimeType);
+      res.setHeader("Content-Disposition", contentDisposition(target.name));
+      res.setHeader("Accept-Ranges", "bytes");
+      // The link is a secret; keep proxies and shared caches out of it.
+      res.setHeader("Cache-Control", "private, no-store");
+      const length = gres.headers["content-length"];
+      if (length) res.setHeader("Content-Length", length);
+      const contentRange = gres.headers["content-range"];
+      if (contentRange) res.setHeader("Content-Range", contentRange);
+
+      const stream = gres.data as unknown as NodeJS.ReadableStream;
+      stream.on("error", (err: Error) => {
+        console.error("Download stream error:", err.message);
+        res.destroy(err);
+      });
+      stream.pipe(res);
+    } catch (err) {
+      console.error("Download error:", err);
+      if (!res.headersSent) {
+        res.status(502).type("text/plain").send("Could not fetch this file from Google.");
+      } else {
+        res.destroy();
+      }
+    }
+  });
 
   let provider: GoogleFederatedProvider | null = null;
 
