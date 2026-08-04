@@ -72,6 +72,13 @@ export interface OnboardingConfig {
    * `/dashboard/<secret>`. When unset, the dashboard is disabled.
    */
   dashboardSecret?: string;
+  /**
+   * Allowlist (lowercased, trimmed) of Google account emails permitted to be
+   * newly linked to this instance via onboarding. Unset/empty => feature off
+   * (fail-open, backward compatible) — anyone who completes the Google
+   * consent screen can link. Already-linked accounts are never affected.
+   */
+  ownerEmails?: string[];
 }
 
 export interface Config {
@@ -99,6 +106,11 @@ function loadOnboarding(): OnboardingConfig {
   const relayUrl = process.env.OAUTH_RELAY_URL?.trim().replace(/\/+$/, "") || undefined;
   const relaySecret = process.env.OAUTH_RELAY_SECRET?.trim() || undefined;
   const dashboardSecret = process.env.DASHBOARD_SECRET?.trim() || undefined;
+  const ownerEmails = process.env.OWNER_EMAILS?.trim()
+    ? process.env.OWNER_EMAILS.split(",")
+        .map((e) => e.trim().toLowerCase())
+        .filter(Boolean)
+    : undefined;
 
   const enabled = !!(
     databaseUrl &&
@@ -118,6 +130,7 @@ function loadOnboarding(): OnboardingConfig {
     relayUrl: relayUrl && relaySecret ? relayUrl : undefined,
     relaySecret: relayUrl && relaySecret ? relaySecret : undefined,
     dashboardSecret,
+    ownerEmails,
   };
 }
 
@@ -307,9 +320,15 @@ export function loadConfig(): Config {
     }
   } catch (err) {
     // With onboarding enabled, env users are optional — everyone comes from the
-    // database instead, so an absence of env credentials is fine.
+    // database instead, so an absence of env credentials is fine. But a
+    // configured MCP_AUTH_TOKEN still needs to resolve to *some* User at the
+    // legacy /mcp entrypoint (resolveLegacyUser matches by token against
+    // config.users) — without one, the token holder is a phantom login that
+    // always 401s even when the database has live onboarded accounts. Give it
+    // an empty accounts list; handleMcp fills it in from Postgres per-request.
     if (onboarding.enabled) {
-      users = [];
+      const token = process.env.MCP_AUTH_TOKEN?.trim() || undefined;
+      users = token ? [{ name: "default", token, accounts: [], defaultAccount: "" }] : [];
     } else {
       throw new Error(
         (err as Error).message +

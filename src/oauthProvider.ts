@@ -14,6 +14,7 @@ import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/serv
 import type { OAuthClientInformationFull, OAuthTokens, OAuthTokenRevocationRequest } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import * as store from "./store.js";
+import { isAccountLinkAllowed } from "./credentialSource.js";
 
 const GOOGLE_SCOPES = [
   "https://www.googleapis.com/auth/spreadsheets",
@@ -34,6 +35,8 @@ export interface FederatedProviderOptions {
   relayUrl?: string;
   /** Shared HMAC secret the relay uses to verify the `state` we sign. */
   relaySecret?: string;
+  /** Allowlist gating which NEW Google accounts may be linked. See config.ts. */
+  ownerEmails?: string[];
 }
 
 function b64url(input: Buffer): string {
@@ -189,6 +192,14 @@ export class GoogleFederatedProvider implements OAuthServerProvider {
     const oauth2 = google.oauth2({ version: "v2", auth: oauth });
     const { data } = await oauth2.userinfo.get();
     const email = data.email ?? "unknown";
+
+    const alreadyLinked = (await store.getRefreshTokenByEmail(email)) !== undefined;
+    if (!isAccountLinkAllowed(email, this.opts.ownerEmails, alreadyLinked)) {
+      throw new Error(
+        `This Google account (${email}) is not authorized to be linked to this server. ` +
+          "Contact the server owner if you believe this is a mistake.",
+      );
+    }
 
     // Google only issues a refresh token on the first grant, and the MCP connect
     // flow deliberately no longer forces a re-consent. Reuse the stored token for

@@ -16,6 +16,7 @@ import {
 import { renderDashboard } from "./dashboard.js";
 import { initDownloads, resolveDownloadLink } from "./downloads.js";
 import { buildUserClients } from "./accounts.js";
+import { selectAccountsForLegacyToken } from "./credentialSource.js";
 
 const JSONRPC_UNAUTHORIZED = {
   jsonrpc: "2.0" as const,
@@ -167,6 +168,7 @@ export async function startHttpServer(config: Config): Promise<void> {
       baseUrl,
       relayUrl: config.onboarding.relayUrl,
       relaySecret: config.onboarding.relaySecret,
+      ownerEmails: config.onboarding.ownerEmails,
     });
 
     const issuerUrl = new URL(baseUrl);
@@ -268,7 +270,14 @@ export async function startHttpServer(config: Config): Promise<void> {
     } else if (!config.requireAuth) {
       user = config.users[0] ?? null;
     } else {
-      user = resolveLegacyUser(req, config);
+      // Static MCP_AUTH_TOKEN identifies WHO is calling, but not which Google
+      // accounts they get: prefer the live onboarding database when it has
+      // accounts linked, falling back to the (possibly empty/stale) env
+      // credentials only when the database is empty. See credentialSource.ts.
+      const legacyUser = resolveLegacyUser(req, config);
+      const onboarded =
+        legacyUser && config.onboarding.enabled ? await userFromGoogleAccounts(config) : null;
+      user = selectAccountsForLegacyToken(legacyUser, onboarded);
     }
 
     if (!user) {
