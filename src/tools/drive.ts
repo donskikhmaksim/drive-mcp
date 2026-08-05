@@ -767,17 +767,20 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
+      const preSnapshot = await renameBindingSnapshot(g, payload.items);
       interface RenameResult {
         fileId: string;
+        oldName: string | null;
         newName: string;
         error?: string;
       }
       const results = await mapWithLimit<RenameItem, RenameResult>(payload.items, async ({ fileId, newName }) => {
+        const oldName = preSnapshot.find((s) => s.fileId === fileId)?.currentName ?? null;
         try {
           await g.drive.files.update({ fileId, requestBody: { name: newName }, fields: "id,name" });
-          return { fileId, newName };
+          return { fileId, oldName, newName };
         } catch (e: unknown) {
-          return { fileId, newName, error: e instanceof Error ? e.message : String(e) };
+          return { fileId, oldName, newName, error: e instanceof Error ? e.message : String(e) };
         }
       });
       return buildMutationResult({
@@ -785,7 +788,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         total: payload.items.length,
         verb: "Renamed",
         summaryIcon: "✏️",
-        verify: (r) => postVerifyFileIdentity(g, r.fileId, r.newName, r.newName),
+        verify: (r) =>
+          postVerifyFileIdentity(g, r.fileId, r.newName, r.oldName ? `${r.oldName} → ${r.newName}` : r.newName),
         reportTitle: "Независимая проверка переименования",
         reportSubtitle: "запрошено ⇄ живые файлы Drive",
         consentStore,
@@ -902,12 +906,31 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       const { payload, auditId } = decision;
       interface MoveResult {
         fileId: string;
-        newParentId: string;
         name: string | null;
+        newParentId: string;
+        newParentName: string | null;
+        removedParentId: string | null;
+        removedParentName: string | null;
         parents: string[] | null;
         error?: string;
       }
+      // Folder names are looked up once per distinct id, not once per item —
+      // several items commonly share the same source/destination folder.
+      const folderNameCache = new Map<string, Promise<string | null>>();
+      const folderName = (id: string | undefined | null): Promise<string | null> => {
+        if (!id) return Promise.resolve(null);
+        let p = folderNameCache.get(id);
+        if (!p) {
+          p = liveFileMeta(g, id).then((m) => m?.name ?? null);
+          folderNameCache.set(id, p);
+        }
+        return p;
+      };
       const results = await mapWithLimit<MoveItem, MoveResult>(payload.items, async ({ fileId, newParentId, removeParentId }) => {
+        const [newParentName, removedParentName] = await Promise.all([
+          folderName(newParentId),
+          folderName(removeParentId),
+        ]);
         try {
           const res = await g.drive.files.update({
             fileId,
@@ -915,9 +938,26 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
             removeParents: removeParentId,
             fields: "id,name,parents",
           });
-          return { fileId, newParentId, name: res.data.name ?? null, parents: res.data.parents ?? null };
+          return {
+            fileId,
+            name: res.data.name ?? null,
+            newParentId,
+            newParentName,
+            removedParentId: removeParentId ?? null,
+            removedParentName,
+            parents: res.data.parents ?? null,
+          };
         } catch (e: unknown) {
-          return { fileId, newParentId, name: null, parents: null, error: e instanceof Error ? e.message : String(e) };
+          return {
+            fileId,
+            name: null,
+            newParentId,
+            newParentName,
+            removedParentId: removeParentId ?? null,
+            removedParentName,
+            parents: null,
+            error: e instanceof Error ? e.message : String(e),
+          };
         }
       });
       return buildMutationResult({
@@ -927,7 +967,10 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         summaryIcon: "📂",
         verify: (r) => {
           const item = payload.items.find((it) => it.fileId === r.fileId);
-          return postVerifyParents(g, r.fileId, r.newParentId, item?.removeParentId, r.name ?? r.fileId);
+          const label = r.name
+            ? `${r.name} → ${r.newParentName ?? r.newParentId}`
+            : r.fileId;
+          return postVerifyParents(g, r.fileId, r.newParentId, item?.removeParentId, label);
         },
         reportTitle: "Независимая проверка перемещения",
         reportSubtitle: "запрошено ⇄ живые родители Drive",
@@ -1035,15 +1078,17 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       const preSnapshot = await trashBindingSnapshot(g, payload.fileIds);
       interface TrashResult {
         fileId: string;
+        name: string | null;
         trashed: boolean;
         error?: string;
       }
       const results = await mapWithLimit<string, TrashResult>(payload.fileIds, async (fileId) => {
+        const preName = preSnapshot.find((s) => s.fileId === fileId)?.name ?? null;
         try {
-          await g.drive.files.update({ fileId, requestBody: { trashed: true }, fields: "id,name,trashed" });
-          return { fileId, trashed: true as const };
+          const res = await g.drive.files.update({ fileId, requestBody: { trashed: true }, fields: "id,name,trashed" });
+          return { fileId, name: res.data.name ?? preName, trashed: true as const };
         } catch (e: unknown) {
-          return { fileId, trashed: false, error: e instanceof Error ? e.message : String(e) };
+          return { fileId, name: preName, trashed: false, error: e instanceof Error ? e.message : String(e) };
         }
       });
       return buildMutationResult({
@@ -1052,7 +1097,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         verb: "Trashed",
         summaryIcon: "🗑",
         verify: (r) => {
-          const label = preSnapshot.find((s) => s.fileId === r.fileId)?.name ?? r.fileId;
+          const label = r.name ?? preSnapshot.find((s) => s.fileId === r.fileId)?.name ?? r.fileId;
           return postVerifyTrashed(g, r.fileId, label);
         },
         reportTitle: "Независимая проверка удаления в Корзину",
@@ -2211,8 +2256,10 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
+      const preSnapshot = await shareBindingSnapshot(g, payload.items);
       interface ShareResult {
         fileId: string;
+        name: string | null;
         role: string;
         type: string;
         emailAddress: string | null;
@@ -2223,6 +2270,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       const results = await mapWithLimit<ShareItem, ShareResult>(
         payload.items,
         async ({ fileId, role, type, emailAddress, domain, sendNotificationEmail, emailMessage, transferOwnership }) => {
+          const name = preSnapshot.find((s) => s.fileId === fileId)?.name ?? null;
           try {
             const res = await g.drive.permissions.create({
               fileId,
@@ -2234,6 +2282,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
             });
             return {
               fileId,
+              name,
               role,
               type,
               emailAddress: emailAddress ?? null,
@@ -2243,6 +2292,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           } catch (e: unknown) {
             return {
               fileId,
+              name,
               role,
               type,
               emailAddress: emailAddress ?? null,
@@ -2263,7 +2313,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
             g,
             r.fileId,
             { type: r.type, role: r.role, emailAddress: r.emailAddress ?? undefined, domain: r.domain ?? undefined },
-            r.fileId,
+            r.name ?? r.fileId,
           ),
         reportTitle: "Независимая проверка открытия доступа",
         reportSubtitle: "запрошено ⇄ живые permissions Drive",
@@ -2365,17 +2415,20 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
+      const preSnapshot = await shareBindingSnapshot(g, payload.items);
       interface UnshareResult {
         fileId: string;
+        name: string | null;
         permissionId: string;
         error?: string;
       }
       const results = await mapWithLimit<UnshareItem, UnshareResult>(payload.items, async ({ fileId, permissionId }) => {
+        const name = preSnapshot.find((s) => s.fileId === fileId)?.name ?? null;
         try {
           await g.drive.permissions.delete({ fileId, permissionId });
-          return { fileId, permissionId };
+          return { fileId, name, permissionId };
         } catch (e: unknown) {
-          return { fileId, permissionId, error: e instanceof Error ? e.message : String(e) };
+          return { fileId, name, permissionId, error: e instanceof Error ? e.message : String(e) };
         }
       });
       return buildMutationResult({
@@ -2383,7 +2436,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         total: payload.items.length,
         verb: "Removed",
         summaryIcon: "🔒",
-        verify: (r) => postVerifyPermissionRemoved(g, r.fileId, r.permissionId, r.fileId),
+        verify: (r) => postVerifyPermissionRemoved(g, r.fileId, r.permissionId, r.name ?? r.fileId),
         reportTitle: "Независимая проверка отзыва доступа",
         reportSubtitle: "запрошено ⇄ живые permissions Drive",
         consentStore,
