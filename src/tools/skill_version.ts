@@ -13,18 +13,22 @@
  */
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { ok, fail, guard, safeText } from "../util.js";
-import type { UserClients } from "../accounts.js";
+import { buildUserClients, type UserClients } from "../accounts.js";
+import { loadConfig } from "../config.js";
 import {
   requireConsent,
   sha256,
   USER_REPLY_DOC,
+  type ConsentStore,
 } from "../consent.js";
 import {
   type DriveConsentContext,
   DEFAULT_CONSENT_CTX,
   buildMutationResult,
 } from "./drive.js";
+import { registerAutoExecutor, type AutoExecutorCtx } from "../autoExecute.js";
 
 const SKILLS_ROOT_FOLDER_ID = "1kjYll-ULT_Z1CFG80HcwgJR6AaS6CVg9";
 const VERSIONS_FOLDER_NAME = "versions";
@@ -109,6 +113,183 @@ async function resolveSkillState(
   return { ok: true, skillFolderId, currentFile };
 }
 
+/** Shared binding-check logic used by BOTH the interactive gate
+ * (`requireConsent`'s `rehash` inside the tool body below) and the
+ * button-press auto-execute path (`registerAutoExecutor`'s `rehash`, called
+ * by http.ts's poller with ONLY the manifest payload — no live client, see
+ * `resolveAutoExecGoogleClients` below). Re-reads the skill folder state
+ * fresh and hashes it the SAME way `plan()` computed the original
+ * `objectHash` — any drift (someone else already bumped the skill, or a new
+ * downgrade/collision appeared) trips a mismatch instead of trusting stale
+ * data. Kept as ONE named function so the two call sites can never silently
+ * diverge. */
+async function rehashSkillVersion(
+  g: ReturnType<UserClients["resolve"]>,
+  addressing: SkillVersionPayload,
+): Promise<string> {
+  const state = await resolveSkillState(g, addressing.skill_name, addressing.new_version, addressing.newFileName);
+  if (!state.ok) {
+    // A drift that now makes the plan invalid (downgrade/collision appeared
+    // since planning) must NOT silently match the old hash — hash something
+    // that can never equal the plan-time value.
+    return sha256({ error: state.error, ts: Date.now() });
+  }
+  return sha256({
+    skill_name: addressing.skill_name,
+    new_version: addressing.new_version,
+    newFileName: addressing.newFileName,
+    skillFolderId: state.skillFolderId,
+    currentFile: state.currentFile,
+  });
+}
+
+/**
+ * Ядро исполнения `skill_version_update` — вынесено из тела тула (по образцу
+ * gmail-mcp/src/tools/gmail.ts's `executeSendBatchCore`, коммит 6e236d6),
+ * чтобы БЫТЬ ВЫЗЫВАЕМЫМ И ИЗ обычного MCP tool-хендлера (модель вызвала
+ * execute второй раз), И ИЗ фонового авто-поллера (кнопка в Telegram сама
+ * триггерит это, без участия модели вообще) — см. `autoExecute.ts`'s
+ * doc-comment про то, почему это НЕ MCP-параметр, а отдельная функция.
+ * Ничего в самой логике не изменилось — просто извлечена в функцию.
+ */
+async function executeSkillVersionCore(
+  payload: SkillVersionPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+  g: ReturnType<UserClients["resolve"]>,
+): Promise<CallToolResult> {
+  const state = await resolveSkillState(g, payload.skill_name, payload.new_version, payload.newFileName);
+  if (!state.ok) {
+    await consentStore
+      .updateConsentAuditOutcome(auditId, { outcome: "failed", error: state.error })
+      .catch(() => {});
+    return fail(state.error);
+  }
+  const { skillFolderId, currentFile } = state;
+
+  // ── Find or create versions/ subfolder ──────────────────────────────
+  let versionsFolderId: string;
+  try {
+    const vfRes = await g.drive.files.list({
+      q: `name='${VERSIONS_FOLDER_NAME}' and '${skillFolderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+      fields: "files(id)",
+      pageSize: 2,
+    });
+    if (vfRes.data.files?.[0]?.id) {
+      versionsFolderId = vfRes.data.files[0].id;
+    } else {
+      const created = await g.drive.files.create({
+        requestBody: {
+          name: VERSIONS_FOLDER_NAME,
+          mimeType: "application/vnd.google-apps.folder",
+          parents: [skillFolderId],
+        },
+        fields: "id",
+      });
+      if (!created.data.id) throw new Error("Failed to create versions/ folder.");
+      versionsFolderId = created.data.id;
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await consentStore.updateConsentAuditOutcome(auditId, { outcome: "failed", error: msg }).catch(() => {});
+    return fail(msg);
+  }
+
+  // ── Archive current file → versions/ ─────────────────────────────────
+  let archivedFile: { id: string; name: string } | null = null;
+  if (currentFile) {
+    await g.drive.files.update({
+      fileId: currentFile.id,
+      addParents: versionsFolderId,
+      removeParents: skillFolderId,
+      fields: "id,parents",
+    });
+    archivedFile = { id: currentFile.id, name: currentFile.name };
+  }
+
+  // ── Create new file at top level ──────────────────────────────────────
+  let newFileId: string | null = null;
+  let error: string | undefined;
+  try {
+    const { Readable } = await import("node:stream");
+    const created = await g.drive.files.create({
+      requestBody: {
+        name: payload.newFileName,
+        mimeType: "text/plain",
+        parents: [skillFolderId],
+      },
+      media: {
+        mimeType: "text/plain",
+        body: Readable.from([payload.new_content]),
+      },
+      fields: "id",
+    });
+    if (!created.data.id) throw new Error("Drive did not return file id.");
+    newFileId = created.data.id;
+  } catch (err) {
+    const hint = archivedFile
+      ? ` Archived file is at versions/${archivedFile.name} (id: ${archivedFile.id}) — move it back manually if needed.`
+      : "";
+    error = `Failed to create new file: ${(err as Error).message}.${hint}`;
+  }
+
+  return buildMutationResult({
+    results: [{ newFileId, newFileName: payload.newFileName, skillFolderId, archivedFile, error }],
+    total: 1,
+    verb: "Updated",
+    summaryIcon: "✅",
+    verify: async (r) => {
+      const meta = await g.drive.files
+        .get({ fileId: r.newFileId ?? "", fields: "id,name,parents" })
+        .then((res) => res.data)
+        .catch(() => null);
+      const lbl = safeText(r.newFileName) || "(файл)";
+      if (!meta) return { outcome: "warn", line: `- ⚠️ **«${lbl}»** — не удалось перепроверить новый файл` };
+      return { outcome: "ok", line: `- ✅ **«${safeText(meta.name ?? lbl)}»** — новый файл существует в Skills/${safeText(payload.skill_name)}` };
+    },
+    reportTitle: "Независимая проверка обновления навыка",
+    reportSubtitle: "запрошено ⇄ живые файлы Drive",
+    consentStore,
+    auditId,
+  });
+}
+
+/** Достаёт человекочитаемый текст из CallToolResult — тот же текст, что
+ * увидела бы модель, для отчёта в Telegram (см. autoExecute.ts's ExecuteFn). */
+function extractText(result: CallToolResult): string {
+  const first = result.content?.[0];
+  return first && first.type === "text" ? first.text : JSON.stringify(result);
+}
+
+/** Builds a Google client for the fixed `personal` account WITHOUT a live
+ * per-request `userClients` instance. Needed because `registerAutoExecutor`
+ * below runs at module scope (once, on import) and its `rehash` callback is
+ * invoked by http.ts's poller with ONLY the manifest payload — no ctx (see
+ * `RehashFn` in autoExecute.ts; `execute` below gets `ctx.clients` for free,
+ * `rehash` does not). Mirrors the SAME fallback http.ts's own
+ * `runAutoExecutePoller` falls back to when no onboarded account is available
+ * (`config.users[0]`) — consistent with `ACCOUNT` already being a fixed,
+ * env-configured account name rather than a per-user onboarded label. */
+function resolveAutoExecGoogleClients(): ReturnType<UserClients["resolve"]> {
+  const user = loadConfig().users[0];
+  if (!user) {
+    throw new Error(
+      "skill_version_update auto-execute: нет настроенного Google-пользователя (GOOGLE_OAUTH_* / GOOGLE_ACCOUNTS).",
+    );
+  }
+  return buildUserClients(user).resolve(ACCOUNT);
+}
+
+registerAutoExecutor("skill_version_update", {
+  rehash: (addressing) => rehashSkillVersion(resolveAutoExecGoogleClients(), addressing as SkillVersionPayload),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as SkillVersionPayload;
+    const g = ctx.clients.resolve(ACCOUNT);
+    const result = await executeSkillVersionCore(p, auditId, ctx.consentStore, g);
+    return extractText(result);
+  },
+});
+
 export function registerSkillVersionTools(server: McpServer, userClients: UserClients, ctx: DriveConsentContext = DEFAULT_CONSENT_CTX) {
   server.registerTool(
     "skill_version_update",
@@ -176,123 +357,14 @@ export function registerSkillVersionTools(server: McpServer, userClients: UserCl
           });
           return { payload, objectHash, preview };
         },
-        rehash: async (addressing) => {
-          const a = addressing as SkillVersionPayload;
-          const state = await resolveSkillState(g, a.skill_name, a.new_version, a.newFileName);
-          if (!state.ok) {
-            // A drift that now makes the plan invalid (downgrade/collision
-            // appeared since planning) must NOT silently match the old hash —
-            // hash something that can never equal the plan-time value.
-            return sha256({ error: state.error, ts: Date.now() });
-          }
-          return sha256({
-            skill_name: a.skill_name,
-            new_version: a.new_version,
-            newFileName: a.newFileName,
-            skillFolderId: state.skillFolderId,
-            currentFile: state.currentFile,
-          });
-        },
+        rehash: (addressing) => rehashSkillVersion(g, addressing as SkillVersionPayload),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const state = await resolveSkillState(g, payload.skill_name, payload.new_version, payload.newFileName);
-      if (!state.ok) {
-        await consentStore
-          .updateConsentAuditOutcome(auditId, { outcome: "failed", error: state.error })
-          .catch(() => {});
-        return fail(state.error);
-      }
-      const { skillFolderId, currentFile } = state;
-
-      // ── Find or create versions/ subfolder ──────────────────────────────
-      let versionsFolderId: string;
-      try {
-        const vfRes = await g.drive.files.list({
-          q: `name='${VERSIONS_FOLDER_NAME}' and '${skillFolderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-          fields: "files(id)",
-          pageSize: 2,
-        });
-        if (vfRes.data.files?.[0]?.id) {
-          versionsFolderId = vfRes.data.files[0].id;
-        } else {
-          const created = await g.drive.files.create({
-            requestBody: {
-              name: VERSIONS_FOLDER_NAME,
-              mimeType: "application/vnd.google-apps.folder",
-              parents: [skillFolderId],
-            },
-            fields: "id",
-          });
-          if (!created.data.id) throw new Error("Failed to create versions/ folder.");
-          versionsFolderId = created.data.id;
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        await consentStore.updateConsentAuditOutcome(auditId, { outcome: "failed", error: msg }).catch(() => {});
-        return fail(msg);
-      }
-
-      // ── Archive current file → versions/ ─────────────────────────────────
-      let archivedFile: { id: string; name: string } | null = null;
-      if (currentFile) {
-        await g.drive.files.update({
-          fileId: currentFile.id,
-          addParents: versionsFolderId,
-          removeParents: skillFolderId,
-          fields: "id,parents",
-        });
-        archivedFile = { id: currentFile.id, name: currentFile.name };
-      }
-
-      // ── Create new file at top level ──────────────────────────────────────
-      let newFileId: string | null = null;
-      let error: string | undefined;
-      try {
-        const { Readable } = await import("node:stream");
-        const created = await g.drive.files.create({
-          requestBody: {
-            name: payload.newFileName,
-            mimeType: "text/plain",
-            parents: [skillFolderId],
-          },
-          media: {
-            mimeType: "text/plain",
-            body: Readable.from([payload.new_content]),
-          },
-          fields: "id",
-        });
-        if (!created.data.id) throw new Error("Drive did not return file id.");
-        newFileId = created.data.id;
-      } catch (err) {
-        const hint = archivedFile
-          ? ` Archived file is at versions/${archivedFile.name} (id: ${archivedFile.id}) — move it back manually if needed.`
-          : "";
-        error = `Failed to create new file: ${(err as Error).message}.${hint}`;
-      }
-
-      return buildMutationResult({
-        results: [{ newFileId, newFileName: payload.newFileName, skillFolderId, archivedFile, error }],
-        total: 1,
-        verb: "Updated",
-        summaryIcon: "✅",
-        verify: async (r) => {
-          const meta = await g.drive.files
-            .get({ fileId: r.newFileId ?? "", fields: "id,name,parents" })
-            .then((res) => res.data)
-            .catch(() => null);
-          const lbl = safeText(r.newFileName) || "(файл)";
-          if (!meta) return { outcome: "warn", line: `- ⚠️ **«${lbl}»** — не удалось перепроверить новый файл` };
-          return { outcome: "ok", line: `- ✅ **«${safeText(meta.name ?? lbl)}»** — новый файл существует в Skills/${safeText(payload.skill_name)}` };
-        },
-        reportTitle: "Независимая проверка обновления навыка",
-        reportSubtitle: "запрошено ⇄ живые файлы Drive",
-        consentStore,
-        auditId,
-      });
+      return executeSkillVersionCore(payload, auditId, consentStore, g);
     }),
   );
 }
