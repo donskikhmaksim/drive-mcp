@@ -5,6 +5,7 @@
 import { z } from "zod";
 import { Readable } from "node:stream";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { ok, fail, guard, isTextual, safeText, mapWithLimit } from "../util.js";
 import { accountField, type UserClients } from "../accounts.js";
 import type { GoogleClients } from "../google.js";
@@ -22,8 +23,10 @@ import {
   USER_REPLY_DOC,
   type ConsentStore,
   type ConsentConfig,
+  type ConsentAddressing,
 } from "../consent.js";
 import type { TgApprovalGate } from "../tg_approval.js";
+import { registerAutoExecutor, type AutoExecutorCtx } from "../autoExecute.js";
 
 // ── Consent-gate context (shared across drive.ts/docs.ts/skill_version.ts) ──
 // mcp-development-standard/references/gate.md. Defined here (drive.ts, the
@@ -472,6 +475,851 @@ function withExportExtension(name: string, exportMime: string): string {
   return name + ext;
 }
 
+// ── Auto-execute registry (Максим, ночь на 2026-08-05: «нажал кнопку в
+// Telegram — исполняется сразу на бэке») ─────────────────────────────────
+// Инфраструктура — src/consent.ts's `tryAutoExecute`, src/autoExecute.ts's
+// `registerAutoExecutor`/`getAutoExecutor`, src/http.ts's
+// `runAutoExecutePoller` — перенесена из gmail-mcp (коммит 6e236d6) в
+// af59235. Ниже — перевод КОНКРЕТНЫХ drive_*-тулов на этот паттерн, по
+// образцу gmail-mcp/src/tools/gmail.ts's `gmail_send`: тело мутации из
+// каждого тула вынесено в `executeXxxCore` (модульного уровня, без изменения
+// логики), и зарегистрировано в реестре, чтобы фоновый поллер мог исполнить
+// его напрямую, в обход модели.
+
+/** Достаёт человекочитаемый текст из CallToolResult — тот же текст, что
+ * увидела бы модель, для отчёта в Telegram (см. autoExecute.ts's ExecuteFn). */
+function extractText(result: CallToolResult): string {
+  const first = result.content?.[0];
+  return first && first.type === "text" ? first.text : JSON.stringify(result);
+}
+
+// ── drive_create_folder ──────────────────────────────────────────────────
+// Degenerate binding (a not-yet-existing folder has no live object to bind
+// against) — same rehash on both the manual (chat) and auto (TG button)
+// paths, no `g` needed.
+
+interface CreateFolderItem {
+  name: string;
+  parentId?: string;
+}
+export interface CreateFolderPayload {
+  account: string;
+  folders: CreateFolderItem[];
+}
+
+/**
+ * Ядро исполнения `drive_create_folder` — вынесено из тела тула (Максим,
+ * 2026-08-05), чтобы БЫТЬ ВЫЗЫВАЕМЫМ И ИЗ обычного MCP tool-хендлера (модель
+ * вызвала execute второй раз), И ИЗ фонового авто-поллера (кнопка в Telegram
+ * сама триггерит это, без участия модели вообще) — см. `autoExecute.ts`'s
+ * doc-comment про то, почему это НЕ MCP-параметр, а отдельная функция.
+ * Ничего в самой логике не изменилось — просто извлечена в функцию.
+ *
+ * Максим явно спрашивал про этот сценарий («создалась папка → где в
+ * Telegram будет ссылка»): `webViewLink` идёт в `results` внутри
+ * `buildMutationResult`, и `ok()` сериализует его через JSON.stringify — так
+ * что `extractText()` в конце вернёт текст, где ссылка присутствует.
+ */
+async function executeCreateFolderCore(
+  g: GoogleClients,
+  payload: CreateFolderPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  interface CreateFolderResult {
+    name: string;
+    id: string | null;
+    webViewLink: string | null;
+    error?: string;
+  }
+  const results = await mapWithLimit<CreateFolderItem, CreateFolderResult>(payload.folders, async ({ name, parentId }) => {
+    try {
+      const res = await g.drive.files.create({
+        requestBody: {
+          name,
+          mimeType: "application/vnd.google-apps.folder",
+          parents: parentId ? [parentId] : undefined,
+        },
+        fields: "id,name,webViewLink",
+      });
+      return { name: res.data.name ?? name, id: res.data.id ?? null, webViewLink: res.data.webViewLink ?? null };
+    } catch (e: unknown) {
+      return { name, id: null, webViewLink: null, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+  return buildMutationResult({
+    results,
+    total: payload.folders.length,
+    verb: "Created",
+    summaryIcon: "📁",
+    verify: (r) => postVerifyFileIdentity(g, r.id ?? "", r.name, r.name),
+    reportTitle: "Независимая проверка создания папок",
+    reportSubtitle: "запрошено ⇄ живые файлы Drive",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("drive_create_folder", {
+  rehash: (addressing) => sha256(addressing as CreateFolderPayload),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as CreateFolderPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeCreateFolderCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ── drive_rename ──────────────────────────────────────────────────────────
+// REAL binding: re-reads each file's LIVE current name — same rehash logic
+// (`renameRehash`) used on both the manual (chat) path and the auto (TG
+// button) path, just wired to `g` differently (already-resolved closure vs
+// `ctx.clients.resolve(...)`).
+
+export interface RenameItem {
+  fileId: string;
+  newName: string;
+}
+export interface RenamePayload {
+  account: string;
+  items: RenameItem[];
+}
+
+async function renameBindingSnapshot(g: GoogleClients, items: RenameItem[]) {
+  return mapWithLimit(items, async (it) => ({
+    fileId: it.fileId,
+    newName: it.newName,
+    currentName: (await liveFileMeta(g, it.fileId))?.name ?? null,
+  }));
+}
+
+async function renameRehash(g: GoogleClients, addressing: ConsentAddressing): Promise<string> {
+  const a = addressing as RenamePayload;
+  const snapshot = await renameBindingSnapshot(g, a.items);
+  return sha256({ account: a.account, items: snapshot });
+}
+
+async function executeRenameCore(
+  g: GoogleClients,
+  payload: RenamePayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  interface RenameResult {
+    fileId: string;
+    newName: string;
+    error?: string;
+  }
+  const results = await mapWithLimit<RenameItem, RenameResult>(payload.items, async ({ fileId, newName }) => {
+    try {
+      await g.drive.files.update({ fileId, requestBody: { name: newName }, fields: "id,name" });
+      return { fileId, newName };
+    } catch (e: unknown) {
+      return { fileId, newName, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+  return buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Renamed",
+    summaryIcon: "✏️",
+    verify: (r) => postVerifyFileIdentity(g, r.fileId, r.newName, r.newName),
+    reportTitle: "Независимая проверка переименования",
+    reportSubtitle: "запрошено ⇄ живые файлы Drive",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("drive_rename", {
+  rehash: (addressing, ctx: AutoExecutorCtx) => {
+    const p = addressing as RenamePayload;
+    const g = ctx.clients.resolve(p.account);
+    return renameRehash(g, addressing);
+  },
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as RenamePayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeRenameCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ── drive_move ────────────────────────────────────────────────────────────
+// REAL binding: re-reads each file's LIVE `parents` — same shared rehash
+// (`moveRehash`) on both paths.
+
+export interface MoveItem {
+  fileId: string;
+  newParentId: string;
+  removeParentId?: string;
+}
+export interface MovePayload {
+  account: string;
+  items: MoveItem[];
+}
+
+async function moveBindingSnapshot(g: GoogleClients, items: MoveItem[]) {
+  return mapWithLimit(items, async (it) => ({
+    fileId: it.fileId,
+    newParentId: it.newParentId,
+    removeParentId: it.removeParentId ?? null,
+    currentParents: (await liveFileMeta(g, it.fileId))?.parents ?? [],
+  }));
+}
+
+async function moveRehash(g: GoogleClients, addressing: ConsentAddressing): Promise<string> {
+  const a = addressing as MovePayload;
+  const snapshot = await moveBindingSnapshot(g, a.items);
+  return sha256({ account: a.account, items: snapshot });
+}
+
+async function executeMoveCore(
+  g: GoogleClients,
+  payload: MovePayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  interface MoveResult {
+    fileId: string;
+    newParentId: string;
+    name: string | null;
+    parents: string[] | null;
+    error?: string;
+  }
+  const results = await mapWithLimit<MoveItem, MoveResult>(payload.items, async ({ fileId, newParentId, removeParentId }) => {
+    try {
+      const res = await g.drive.files.update({
+        fileId,
+        addParents: newParentId,
+        removeParents: removeParentId,
+        fields: "id,name,parents",
+      });
+      return { fileId, newParentId, name: res.data.name ?? null, parents: res.data.parents ?? null };
+    } catch (e: unknown) {
+      return { fileId, newParentId, name: null, parents: null, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+  return buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Moved",
+    summaryIcon: "📂",
+    verify: (r) => {
+      const item = payload.items.find((it) => it.fileId === r.fileId);
+      return postVerifyParents(g, r.fileId, r.newParentId, item?.removeParentId, r.name ?? r.fileId);
+    },
+    reportTitle: "Независимая проверка перемещения",
+    reportSubtitle: "запрошено ⇄ живые родители Drive",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("drive_move", {
+  rehash: (addressing, ctx: AutoExecutorCtx) => {
+    const p = addressing as MovePayload;
+    const g = ctx.clients.resolve(p.account);
+    return moveRehash(g, addressing);
+  },
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as MovePayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeMoveCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ── drive_trash ───────────────────────────────────────────────────────────
+// REAL binding: re-reads each file's LIVE {name, parents, trashed}. Also
+// captures a pre-mutation snapshot (identity-postverify.md §5.2) — same in
+// both executeTrashCore call sites, since it lives inside the core function.
+
+export interface TrashPayload {
+  account: string;
+  fileIds: string[];
+}
+
+async function trashBindingSnapshot(g: GoogleClients, fileIds: string[]) {
+  return mapWithLimit(fileIds, async (fileId) => {
+    const meta = await liveFileMeta(g, fileId);
+    return {
+      fileId,
+      name: meta?.name ?? null,
+      parents: meta?.parents ?? [],
+      trashed: meta?.trashed ?? null,
+    };
+  });
+}
+
+async function trashRehash(g: GoogleClients, addressing: ConsentAddressing): Promise<string> {
+  const a = addressing as TrashPayload;
+  const snapshot = await trashBindingSnapshot(g, a.fileIds);
+  return sha256({ account: a.account, fileIds: a.fileIds, snapshot });
+}
+
+async function executeTrashCore(
+  g: GoogleClients,
+  payload: TrashPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const preSnapshot = await trashBindingSnapshot(g, payload.fileIds);
+  interface TrashResult {
+    fileId: string;
+    trashed: boolean;
+    error?: string;
+  }
+  const results = await mapWithLimit<string, TrashResult>(payload.fileIds, async (fileId) => {
+    try {
+      await g.drive.files.update({ fileId, requestBody: { trashed: true }, fields: "id,name,trashed" });
+      return { fileId, trashed: true as const };
+    } catch (e: unknown) {
+      return { fileId, trashed: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+  return buildMutationResult({
+    results,
+    total: payload.fileIds.length,
+    verb: "Trashed",
+    summaryIcon: "🗑",
+    verify: (r) => {
+      const label = preSnapshot.find((s) => s.fileId === r.fileId)?.name ?? r.fileId;
+      return postVerifyTrashed(g, r.fileId, label);
+    },
+    reportTitle: "Независимая проверка удаления в Корзину",
+    reportSubtitle: "запрошено ⇄ живые файлы Drive",
+    consentStore,
+    auditId,
+    preSnapshot,
+  });
+}
+
+registerAutoExecutor("drive_trash", {
+  rehash: (addressing, ctx: AutoExecutorCtx) => {
+    const p = addressing as TrashPayload;
+    const g = ctx.clients.resolve(p.account);
+    return trashRehash(g, addressing);
+  },
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as TrashPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeTrashCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ── drive_upload_file ────────────────────────────────────────────────────
+// Degenerate binding, same as drive_create_folder — brand-new files have no
+// live object to bind against yet.
+
+export interface UploadFileItem {
+  name: string;
+  mimeType?: string;
+  parentId?: string;
+  content_text?: string;
+  content_base64?: string;
+}
+export interface UploadFilePayload {
+  account: string;
+  files: UploadFileItem[];
+}
+
+async function executeUploadFileCore(
+  g: GoogleClients,
+  payload: UploadFilePayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  interface UploadFileResult {
+    name: string;
+    id: string | null;
+    webViewLink: string | null;
+    error?: string;
+  }
+  const results = await mapWithLimit<UploadFileItem, UploadFileResult>(
+    payload.files,
+    async ({ name, mimeType, parentId, content_text, content_base64 }) => {
+      try {
+        if (!content_text && !content_base64) {
+          return { name, id: null, webViewLink: null, error: "Provide either content_text or content_base64." };
+        }
+        const buffer = content_base64
+          ? Buffer.from(content_base64, "base64")
+          : Buffer.from(content_text ?? "", "utf8");
+        const mediaMimeType = mimeType ?? "application/octet-stream";
+        const res = await g.drive.files.create({
+          requestBody: { name, parents: parentId ? [parentId] : undefined },
+          media: { mimeType: mediaMimeType, body: Readable.from(buffer) },
+          fields: "id,name,webViewLink",
+        });
+        return { name: res.data.name ?? name, id: res.data.id ?? null, webViewLink: res.data.webViewLink ?? null };
+      } catch (e: unknown) {
+        return { name, id: null, webViewLink: null, error: e instanceof Error ? e.message : String(e) };
+      }
+    },
+  );
+  return buildMutationResult({
+    results,
+    total: payload.files.length,
+    verb: "Uploaded",
+    summaryIcon: "⬆️",
+    verify: (r) => postVerifyFileIdentity(g, r.id ?? "", r.name, r.name),
+    reportTitle: "Независимая проверка загрузки",
+    reportSubtitle: "запрошено ⇄ живые файлы Drive",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("drive_upload_file", {
+  rehash: (addressing) => sha256(addressing as UploadFilePayload),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as UploadFilePayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeUploadFileCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ── drive_create_upload_session ──────────────────────────────────────────
+// For a REPLACE (`fileId` given) this is a REAL rehash of the live target
+// file; for a brand-new file it's the same degenerate case as
+// drive_create_folder/drive_upload_file — `uploadSessionBindingSnapshot`
+// handles both uniformly.
+
+export interface UploadSessionItem {
+  name?: string;
+  mimeType?: string;
+  sizeBytes?: number;
+  parentId?: string;
+  fileId?: string;
+}
+export interface UploadSessionPayload {
+  account: string;
+  files: UploadSessionItem[];
+}
+
+async function uploadSessionBindingSnapshot(g: GoogleClients, files: UploadSessionItem[]) {
+  return mapWithLimit(files, async (f) => {
+    if (!f.fileId) return { ...f, liveTarget: null };
+    const meta = await liveFileMeta(g, f.fileId);
+    return {
+      ...f,
+      liveTarget: meta ? { name: meta.name, mimeType: meta.mimeType, md5Checksum: meta.md5Checksum } : null,
+    };
+  });
+}
+
+async function uploadSessionRehash(g: GoogleClients, addressing: ConsentAddressing): Promise<string> {
+  const a = addressing as UploadSessionPayload;
+  const snapshot = await uploadSessionBindingSnapshot(g, a.files);
+  return sha256({ account: a.account, files: snapshot });
+}
+
+async function executeUploadSessionCore(
+  g: GoogleClients,
+  payload: UploadSessionPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const token = await g.accessToken();
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  interface UploadSessionResult {
+    name: string | null;
+    fileId: string | null;
+    mode?: "create" | "replace";
+    uploadUrl?: string;
+    mimeType?: string;
+    sizeBytes?: number | null;
+    expiresAt?: string;
+    howTo?: string;
+    error?: string;
+  }
+  const results = await mapWithLimit<UploadSessionItem, UploadSessionResult>(payload.files, async ({ name, mimeType, sizeBytes, parentId, fileId }) => {
+    const label = name ?? fileId ?? null;
+    try {
+      if (!name && !fileId) {
+        return { name: label, fileId: fileId ?? null, error: "Provide `name` (new file) or `fileId` (replace)." };
+      }
+      if (fileId && parentId) {
+        return {
+          name: label,
+          fileId: fileId ?? null,
+          error: "parentId cannot be combined with fileId — use drive_move to reparent.",
+        };
+      }
+      const resolvedMime = mimeType ?? DEFAULT_UPLOAD_MIME;
+      const url =
+        `${UPLOAD_ENDPOINT}${fileId ? `/${encodeURIComponent(fileId)}` : ""}` +
+        `?uploadType=resumable&supportsAllDrives=true` +
+        `&fields=${encodeURIComponent(UPLOAD_FIELDS)}`;
+      const metadata: Record<string, unknown> = {};
+      if (name) metadata.name = name;
+      if (!fileId && parentId) metadata.parents = [parentId];
+
+      const res = await fetch(url, {
+        method: fileId ? "PATCH" : "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json; charset=UTF-8",
+          "X-Upload-Content-Type": resolvedMime,
+          ...(sizeBytes ? { "X-Upload-Content-Length": String(sizeBytes) } : {}),
+        },
+        body: JSON.stringify(metadata),
+      });
+      if (!res.ok) {
+        return { name: label, fileId: fileId ?? null, error: `Google returned ${res.status}: ${await errorBody(res)}` };
+      }
+      const uploadUrl = res.headers.get("location");
+      if (!uploadUrl) {
+        return {
+          name: label,
+          fileId: fileId ?? null,
+          error: "Google did not return a resumable session URI (no Location header).",
+        };
+      }
+      const total = sizeBytes ? String(sizeBytes) : "*";
+      const lastByte = sizeBytes ? String(sizeBytes - 1) : "<end>";
+      const howTo =
+        `PUT the raw bytes to uploadUrl with headers "Content-Type: ${resolvedMime}" and ` +
+        `"Content-Range: bytes 0-${lastByte}/${total}"` +
+        (sizeBytes
+          ? " (a single PUT of the whole file is fine). "
+          : " — the total size is unknown, so keep sending '*' as the total and put the " +
+            "real total in the Content-Range of the FINAL chunk to finalise the upload. ") +
+        "Then call drive_confirm_upload with the same uploadUrl.";
+      return {
+        name: name ?? null,
+        fileId: fileId ?? null,
+        mode: fileId ? ("replace" as const) : ("create" as const),
+        uploadUrl,
+        mimeType: resolvedMime,
+        sizeBytes: sizeBytes ?? null,
+        expiresAt,
+        howTo,
+      };
+    } catch (e: unknown) {
+      return { name: label, fileId: fileId ?? null, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+  // Honest limit (STANDARD §15.1 Q20, same convention as sheets-mcp's
+  // raw_batch_update): the actual bytes travel via a LATER, out-of-band
+  // client→Google PUT this server never sees, so nothing here can confirm
+  // content landed — that is what drive_confirm_upload is for. This only
+  // confirms the session-creation call itself succeeded.
+  return buildMutationResult({
+    results,
+    total: payload.files.length,
+    verb: "Created session(s) for",
+    summaryIcon: "⬆️",
+    verify: async (r) =>
+      r.uploadUrl
+        ? {
+            outcome: "warn",
+            line: `- ⚠️ **«${safeText(r.name ?? r.fileId ?? "", 60)}»** — сессия создана; фактическая загрузка байт идёт напрямую клиент→Google и не проверяется этим вызовом, используйте drive_confirm_upload`,
+          }
+        : { outcome: "warn", line: `- ⚠️ **«${safeText(r.name ?? r.fileId ?? "", 60)}»** — сессия не создана` },
+    reportTitle: "Независимая проверка создания сессии загрузки",
+    reportSubtitle: "честный предел: содержимое проверяется отдельно через drive_confirm_upload",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("drive_create_upload_session", {
+  rehash: (addressing, ctx: AutoExecutorCtx) => {
+    const p = addressing as UploadSessionPayload;
+    const g = ctx.clients.resolve(p.account);
+    return uploadSessionRehash(g, addressing);
+  },
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as UploadSessionPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeUploadSessionCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ── drive_overwrite_file ─────────────────────────────────────────────────
+// REAL binding: re-reads each target's LIVE {name, mimeType, md5Checksum,
+// modifiedTime}. Also captures a pre-mutation snapshot (identity-postverify
+// §5.2) inside the core function, so both call sites get it identically.
+
+export interface OverwriteItem {
+  fileId: string;
+  mimeType?: string;
+  content_text?: string;
+  content_base64?: string;
+}
+export interface OverwritePayload {
+  account: string;
+  files: OverwriteItem[];
+}
+
+async function overwriteBindingSnapshot(g: GoogleClients, files: OverwriteItem[]) {
+  return mapWithLimit(files, async (f) => {
+    const meta = await liveFileMeta(g, f.fileId);
+    return {
+      fileId: f.fileId,
+      mimeType: f.mimeType,
+      name: meta?.name ?? null,
+      liveMimeType: meta?.mimeType ?? null,
+      md5Checksum: meta?.md5Checksum ?? null,
+      modifiedTime: meta?.modifiedTime ?? null,
+      size: meta?.size ?? null,
+    };
+  });
+}
+
+async function overwriteRehash(g: GoogleClients, addressing: ConsentAddressing): Promise<string> {
+  const a = addressing as OverwritePayload;
+  const snapshot = await overwriteBindingSnapshot(g, a.files);
+  return sha256({ account: a.account, files: snapshot });
+}
+
+async function executeOverwriteCore(
+  g: GoogleClients,
+  payload: OverwritePayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  const preSnapshot = await overwriteBindingSnapshot(g, payload.files);
+  interface OverwriteResult {
+    fileId: string;
+    name: string | null;
+    error?: string;
+  }
+  const results = await mapWithLimit<OverwriteItem, OverwriteResult>(payload.files, async ({ fileId, mimeType, content_text, content_base64 }) => {
+    try {
+      if (!content_text && !content_base64) {
+        return { fileId, name: null, error: "Provide either content_text or content_base64." };
+      }
+      const buffer = content_base64
+        ? Buffer.from(content_base64, "base64")
+        : Buffer.from(content_text ?? "", "utf8");
+      const mediaMimeType = mimeType ?? "application/octet-stream";
+      const res = await g.drive.files.update({
+        fileId,
+        requestBody: {},
+        media: { mimeType: mediaMimeType, body: Readable.from(buffer) },
+        fields: "id,name",
+      });
+      return { fileId, name: res.data.name ?? null };
+    } catch (e: unknown) {
+      return { fileId, name: null, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+  return buildMutationResult({
+    results,
+    total: payload.files.length,
+    verb: "Overwrote",
+    summaryIcon: "♻️",
+    verify: (r) => {
+      const before = preSnapshot.find((s) => s.fileId === r.fileId) ?? null;
+      return postVerifyOverwritten(g, r.fileId, before, r.name ?? r.fileId);
+    },
+    reportTitle: "Независимая проверка перезаписи",
+    reportSubtitle: "запрошено ⇄ живые метаданные Drive",
+    consentStore,
+    auditId,
+    preSnapshot,
+  });
+}
+
+registerAutoExecutor("drive_overwrite_file", {
+  rehash: (addressing, ctx: AutoExecutorCtx) => {
+    const p = addressing as OverwritePayload;
+    const g = ctx.clients.resolve(p.account);
+    return overwriteRehash(g, addressing);
+  },
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as OverwritePayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeOverwriteCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ── drive_share / drive_unshare ──────────────────────────────────────────
+// Both REAL-bind against the same live {name, permissions} snapshot
+// (`shareBindingSnapshot`), shared here since it's identical for granting
+// and revoking access — only the rehash payload shape differs.
+
+export interface ShareItem {
+  fileId: string;
+  role: "reader" | "commenter" | "writer" | "fileOrganizer" | "organizer" | "owner";
+  type: "user" | "group" | "domain" | "anyone";
+  emailAddress?: string;
+  domain?: string;
+  sendNotificationEmail?: boolean;
+  emailMessage?: string;
+  transferOwnership?: boolean;
+}
+export interface SharePayload {
+  account: string;
+  items: ShareItem[];
+}
+
+export interface UnshareItem {
+  fileId: string;
+  permissionId: string;
+}
+export interface UnsharePayload {
+  account: string;
+  items: UnshareItem[];
+}
+
+async function shareBindingSnapshot(g: GoogleClients, items: Array<{ fileId: string }>) {
+  return mapWithLimit(items, async (it) => {
+    const [meta, perms] = await Promise.all([liveFileMeta(g, it.fileId), livePermissions(g, it.fileId)]);
+    return {
+      fileId: it.fileId,
+      name: meta?.name ?? null,
+      permissions: perms ?? [],
+    };
+  });
+}
+
+async function shareRehash(g: GoogleClients, addressing: ConsentAddressing): Promise<string> {
+  const a = addressing as SharePayload;
+  const snapshot = await shareBindingSnapshot(g, a.items);
+  return sha256({ account: a.account, items: a.items, snapshot });
+}
+
+async function unshareRehash(g: GoogleClients, addressing: ConsentAddressing): Promise<string> {
+  const a = addressing as UnsharePayload;
+  const snapshot = await shareBindingSnapshot(g, a.items);
+  return sha256({ account: a.account, items: a.items, snapshot });
+}
+
+async function executeShareCore(
+  g: GoogleClients,
+  payload: SharePayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  interface ShareResult {
+    fileId: string;
+    role: string;
+    type: string;
+    emailAddress: string | null;
+    domain: string | null;
+    permissionId: string | null;
+    error?: string;
+  }
+  const results = await mapWithLimit<ShareItem, ShareResult>(
+    payload.items,
+    async ({ fileId, role, type, emailAddress, domain, sendNotificationEmail, emailMessage, transferOwnership }) => {
+      try {
+        const res = await g.drive.permissions.create({
+          fileId,
+          sendNotificationEmail: sendNotificationEmail ?? false,
+          emailMessage,
+          transferOwnership: transferOwnership ?? false,
+          requestBody: { role, type, emailAddress, domain },
+          fields: "id,role,type,emailAddress",
+        });
+        return {
+          fileId,
+          role,
+          type,
+          emailAddress: emailAddress ?? null,
+          domain: domain ?? null,
+          permissionId: res.data.id ?? null,
+        };
+      } catch (e: unknown) {
+        return {
+          fileId,
+          role,
+          type,
+          emailAddress: emailAddress ?? null,
+          domain: domain ?? null,
+          permissionId: null,
+          error: e instanceof Error ? e.message : String(e),
+        };
+      }
+    },
+  );
+  return buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Shared",
+    summaryIcon: "✅",
+    verify: (r) =>
+      postVerifyPermissionGranted(
+        g,
+        r.fileId,
+        { type: r.type, role: r.role, emailAddress: r.emailAddress ?? undefined, domain: r.domain ?? undefined },
+        r.fileId,
+      ),
+    reportTitle: "Независимая проверка открытия доступа",
+    reportSubtitle: "запрошено ⇄ живые permissions Drive",
+    consentStore,
+    auditId,
+  });
+}
+
+async function executeUnshareCore(
+  g: GoogleClients,
+  payload: UnsharePayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  interface UnshareResult {
+    fileId: string;
+    permissionId: string;
+    error?: string;
+  }
+  const results = await mapWithLimit<UnshareItem, UnshareResult>(payload.items, async ({ fileId, permissionId }) => {
+    try {
+      await g.drive.permissions.delete({ fileId, permissionId });
+      return { fileId, permissionId };
+    } catch (e: unknown) {
+      return { fileId, permissionId, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+  return buildMutationResult({
+    results,
+    total: payload.items.length,
+    verb: "Removed",
+    summaryIcon: "🔒",
+    verify: (r) => postVerifyPermissionRemoved(g, r.fileId, r.permissionId, r.fileId),
+    reportTitle: "Независимая проверка отзыва доступа",
+    reportSubtitle: "запрошено ⇄ живые permissions Drive",
+    consentStore,
+    auditId,
+  });
+}
+
+registerAutoExecutor("drive_share", {
+  rehash: (addressing, ctx: AutoExecutorCtx) => {
+    const p = addressing as SharePayload;
+    const g = ctx.clients.resolve(p.account);
+    return shareRehash(g, addressing);
+  },
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as SharePayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeShareCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+registerAutoExecutor("drive_unshare", {
+  rehash: (addressing, ctx: AutoExecutorCtx) => {
+    const p = addressing as UnsharePayload;
+    const g = ctx.clients.resolve(p.account);
+    return unshareRehash(g, addressing);
+  },
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as UnsharePayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeUnshareCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
 export function registerDriveTools(server: McpServer, clients: UserClients, ctx: DriveConsentContext = DEFAULT_CONSENT_CTX) {
   const account = accountField(clients);
 
@@ -565,15 +1413,6 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
   // on BOTH sides. Post-verify is still real: each created folder is
   // re-fetched by id to confirm it actually exists with the requested name.
 
-  interface CreateFolderItem {
-    name: string;
-    parentId?: string;
-  }
-  interface CreateFolderPayload {
-    account: string;
-    folders: CreateFolderItem[];
-  }
-
   server.registerTool(
     "drive_create_folder",
     {
@@ -640,38 +1479,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      interface CreateFolderResult {
-        name: string;
-        id: string | null;
-        webViewLink: string | null;
-        error?: string;
-      }
-      const results = await mapWithLimit<CreateFolderItem, CreateFolderResult>(payload.folders, async ({ name, parentId }) => {
-        try {
-          const res = await g.drive.files.create({
-            requestBody: {
-              name,
-              mimeType: "application/vnd.google-apps.folder",
-              parents: parentId ? [parentId] : undefined,
-            },
-            fields: "id,name,webViewLink",
-          });
-          return { name: res.data.name ?? name, id: res.data.id ?? null, webViewLink: res.data.webViewLink ?? null };
-        } catch (e: unknown) {
-          return { name, id: null, webViewLink: null, error: e instanceof Error ? e.message : String(e) };
-        }
-      });
-      return buildMutationResult({
-        results,
-        total: payload.folders.length,
-        verb: "Created",
-        summaryIcon: "📁",
-        verify: (r) => postVerifyFileIdentity(g, r.id ?? "", r.name, r.name),
-        reportTitle: "Независимая проверка создания папок",
-        reportSubtitle: "запрошено ⇄ живые файлы Drive",
-        consentStore,
-        auditId,
-      });
+      return executeCreateFolderCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -679,23 +1487,6 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
   // REAL binding: re-reads each file's LIVE current name at plan and again at
   // rehash — a concurrent rename/delete between plan and execute changes the
   // snapshot and trips the drift check (gate.md §3.3(2)).
-
-  interface RenameItem {
-    fileId: string;
-    newName: string;
-  }
-  interface RenamePayload {
-    account: string;
-    items: RenameItem[];
-  }
-
-  async function renameBindingSnapshot(g: GoogleClients, items: RenameItem[]) {
-    return mapWithLimit(items, async (it) => ({
-      fileId: it.fileId,
-      newName: it.newName,
-      currentName: (await liveFileMeta(g, it.fileId))?.name ?? null,
-    }));
-  }
 
   server.registerTool(
     "drive_rename",
@@ -756,41 +1547,14 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           const objectHash = sha256({ account: accountName, items: snapshot });
           return { payload, objectHash, preview, batchSize: items.length };
         },
-        rehash: async (addressing) => {
-          const a = addressing as RenamePayload;
-          const snapshot = await renameBindingSnapshot(g, a.items);
-          return sha256({ account: a.account, items: snapshot });
-        },
+        rehash: (addressing) => renameRehash(g, addressing),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      interface RenameResult {
-        fileId: string;
-        newName: string;
-        error?: string;
-      }
-      const results = await mapWithLimit<RenameItem, RenameResult>(payload.items, async ({ fileId, newName }) => {
-        try {
-          await g.drive.files.update({ fileId, requestBody: { name: newName }, fields: "id,name" });
-          return { fileId, newName };
-        } catch (e: unknown) {
-          return { fileId, newName, error: e instanceof Error ? e.message : String(e) };
-        }
-      });
-      return buildMutationResult({
-        results,
-        total: payload.items.length,
-        verb: "Renamed",
-        summaryIcon: "✏️",
-        verify: (r) => postVerifyFileIdentity(g, r.fileId, r.newName, r.newName),
-        reportTitle: "Независимая проверка переименования",
-        reportSubtitle: "запрошено ⇄ живые файлы Drive",
-        consentStore,
-        auditId,
-      });
+      return executeRenameCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -799,25 +1563,6 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
   // again at rehash — someone else moving the file between plan and execute
   // changes the snapshot and trips the drift check. Low priority per
   // Maksim's decision (2026-08-04), still gated like every other write.
-
-  interface MoveItem {
-    fileId: string;
-    newParentId: string;
-    removeParentId?: string;
-  }
-  interface MovePayload {
-    account: string;
-    items: MoveItem[];
-  }
-
-  async function moveBindingSnapshot(g: GoogleClients, items: MoveItem[]) {
-    return mapWithLimit(items, async (it) => ({
-      fileId: it.fileId,
-      newParentId: it.newParentId,
-      removeParentId: it.removeParentId ?? null,
-      currentParents: (await liveFileMeta(g, it.fileId))?.parents ?? [],
-    }));
-  }
 
   server.registerTool(
     "drive_move",
@@ -889,51 +1634,14 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           const objectHash = sha256({ account: accountName, items: snapshot });
           return { payload, objectHash, preview, batchSize: items.length };
         },
-        rehash: async (addressing) => {
-          const a = addressing as MovePayload;
-          const snapshot = await moveBindingSnapshot(g, a.items);
-          return sha256({ account: a.account, items: snapshot });
-        },
+        rehash: (addressing) => moveRehash(g, addressing),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      interface MoveResult {
-        fileId: string;
-        newParentId: string;
-        name: string | null;
-        parents: string[] | null;
-        error?: string;
-      }
-      const results = await mapWithLimit<MoveItem, MoveResult>(payload.items, async ({ fileId, newParentId, removeParentId }) => {
-        try {
-          const res = await g.drive.files.update({
-            fileId,
-            addParents: newParentId,
-            removeParents: removeParentId,
-            fields: "id,name,parents",
-          });
-          return { fileId, newParentId, name: res.data.name ?? null, parents: res.data.parents ?? null };
-        } catch (e: unknown) {
-          return { fileId, newParentId, name: null, parents: null, error: e instanceof Error ? e.message : String(e) };
-        }
-      });
-      return buildMutationResult({
-        results,
-        total: payload.items.length,
-        verb: "Moved",
-        summaryIcon: "📂",
-        verify: (r) => {
-          const item = payload.items.find((it) => it.fileId === r.fileId);
-          return postVerifyParents(g, r.fileId, r.newParentId, item?.removeParentId, r.name ?? r.fileId);
-        },
-        reportTitle: "Независимая проверка перемещения",
-        reportSubtitle: "запрошено ⇄ живые родители Drive",
-        consentStore,
-        auditId,
-      });
+      return executeMoveCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -942,23 +1650,6 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
   // and again at rehash. Pre-snapshot (identity-postverify.md §5.2): the
   // plan-time read IS the "before" snapshot of a necessarily-somewhat-
   // irreversible mutation — captured explicitly and attached to the audit row.
-
-  interface TrashPayload {
-    account: string;
-    fileIds: string[];
-  }
-
-  async function trashBindingSnapshot(g: GoogleClients, fileIds: string[]) {
-    return mapWithLimit(fileIds, async (fileId) => {
-      const meta = await liveFileMeta(g, fileId);
-      return {
-        fileId,
-        name: meta?.name ?? null,
-        parents: meta?.parents ?? [],
-        trashed: meta?.trashed ?? null,
-      };
-    });
-  }
 
   server.registerTool(
     "drive_trash",
@@ -1021,46 +1712,14 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           const objectHash = sha256({ account: accountName, fileIds, snapshot });
           return { payload, objectHash, preview, batchSize: fileIds.length };
         },
-        rehash: async (addressing) => {
-          const a = addressing as TrashPayload;
-          const snapshot = await trashBindingSnapshot(g, a.fileIds);
-          return sha256({ account: a.account, fileIds: a.fileIds, snapshot });
-        },
+        rehash: (addressing) => trashRehash(g, addressing),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const preSnapshot = await trashBindingSnapshot(g, payload.fileIds);
-      interface TrashResult {
-        fileId: string;
-        trashed: boolean;
-        error?: string;
-      }
-      const results = await mapWithLimit<string, TrashResult>(payload.fileIds, async (fileId) => {
-        try {
-          await g.drive.files.update({ fileId, requestBody: { trashed: true }, fields: "id,name,trashed" });
-          return { fileId, trashed: true as const };
-        } catch (e: unknown) {
-          return { fileId, trashed: false, error: e instanceof Error ? e.message : String(e) };
-        }
-      });
-      return buildMutationResult({
-        results,
-        total: payload.fileIds.length,
-        verb: "Trashed",
-        summaryIcon: "🗑",
-        verify: (r) => {
-          const label = preSnapshot.find((s) => s.fileId === r.fileId)?.name ?? r.fileId;
-          return postVerifyTrashed(g, r.fileId, label);
-        },
-        reportTitle: "Независимая проверка удаления в Корзину",
-        reportSubtitle: "запрошено ⇄ живые файлы Drive",
-        consentStore,
-        auditId,
-        preSnapshot,
-      });
+      return executeTrashCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -1069,18 +1728,6 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
   // exception, same as drive_create_folder above): brand-new files have no
   // live object to bind against, so objectHash = sha256(payload) on BOTH
   // sides. Post-verify is still real: each uploaded file is re-fetched by id.
-
-  interface UploadFileItem {
-    name: string;
-    mimeType?: string;
-    parentId?: string;
-    content_text?: string;
-    content_base64?: string;
-  }
-  interface UploadFilePayload {
-    account: string;
-    files: UploadFileItem[];
-  }
 
   server.registerTool(
     "drive_upload_file",
@@ -1169,45 +1816,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      interface UploadFileResult {
-        name: string;
-        id: string | null;
-        webViewLink: string | null;
-        error?: string;
-      }
-      const results = await mapWithLimit<UploadFileItem, UploadFileResult>(
-        payload.files,
-        async ({ name, mimeType, parentId, content_text, content_base64 }) => {
-          try {
-            if (!content_text && !content_base64) {
-              return { name, id: null, webViewLink: null, error: "Provide either content_text or content_base64." };
-            }
-            const buffer = content_base64
-              ? Buffer.from(content_base64, "base64")
-              : Buffer.from(content_text ?? "", "utf8");
-            const mediaMimeType = mimeType ?? "application/octet-stream";
-            const res = await g.drive.files.create({
-              requestBody: { name, parents: parentId ? [parentId] : undefined },
-              media: { mimeType: mediaMimeType, body: Readable.from(buffer) },
-              fields: "id,name,webViewLink",
-            });
-            return { name: res.data.name ?? name, id: res.data.id ?? null, webViewLink: res.data.webViewLink ?? null };
-          } catch (e: unknown) {
-            return { name, id: null, webViewLink: null, error: e instanceof Error ? e.message : String(e) };
-          }
-        },
-      );
-      return buildMutationResult({
-        results,
-        total: payload.files.length,
-        verb: "Uploaded",
-        summaryIcon: "⬆️",
-        verify: (r) => postVerifyFileIdentity(g, r.id ?? "", r.name, r.name),
-        reportTitle: "Независимая проверка загрузки",
-        reportSubtitle: "запрошено ⇄ живые файлы Drive",
-        consentStore,
-        auditId,
-      });
+      return executeUploadFileCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -1223,29 +1832,6 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
   // between plan and execute trips drift. For a brand-new file (no `fileId`)
   // there is no live object yet — the same documented degenerate case as
   // drive_create_folder/drive_upload_file.
-
-  interface UploadSessionItem {
-    name?: string;
-    mimeType?: string;
-    sizeBytes?: number;
-    parentId?: string;
-    fileId?: string;
-  }
-  interface UploadSessionPayload {
-    account: string;
-    files: UploadSessionItem[];
-  }
-
-  async function uploadSessionBindingSnapshot(g: GoogleClients, files: UploadSessionItem[]) {
-    return mapWithLimit(files, async (f) => {
-      if (!f.fileId) return { ...f, liveTarget: null };
-      const meta = await liveFileMeta(g, f.fileId);
-      return {
-        ...f,
-        liveTarget: meta ? { name: meta.name, mimeType: meta.mimeType, md5Checksum: meta.md5Checksum } : null,
-      };
-    });
-  }
 
   server.registerTool(
     "drive_create_upload_session",
@@ -1355,119 +1941,14 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           const objectHash = sha256({ account: accountName, files: snapshot });
           return { payload, objectHash, preview, batchSize: files.length };
         },
-        rehash: async (addressing) => {
-          const a = addressing as UploadSessionPayload;
-          const snapshot = await uploadSessionBindingSnapshot(g, a.files);
-          return sha256({ account: a.account, files: snapshot });
-        },
+        rehash: (addressing) => uploadSessionRehash(g, addressing),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const token = await g.accessToken();
-      const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-      interface UploadSessionResult {
-        name: string | null;
-        fileId: string | null;
-        mode?: "create" | "replace";
-        uploadUrl?: string;
-        mimeType?: string;
-        sizeBytes?: number | null;
-        expiresAt?: string;
-        howTo?: string;
-        error?: string;
-      }
-      const results = await mapWithLimit<UploadSessionItem, UploadSessionResult>(payload.files, async ({ name, mimeType, sizeBytes, parentId, fileId }) => {
-        const label = name ?? fileId ?? null;
-        try {
-          if (!name && !fileId) {
-            return { name: label, fileId: fileId ?? null, error: "Provide `name` (new file) or `fileId` (replace)." };
-          }
-          if (fileId && parentId) {
-            return {
-              name: label,
-              fileId: fileId ?? null,
-              error: "parentId cannot be combined with fileId — use drive_move to reparent.",
-            };
-          }
-          const resolvedMime = mimeType ?? DEFAULT_UPLOAD_MIME;
-          const url =
-            `${UPLOAD_ENDPOINT}${fileId ? `/${encodeURIComponent(fileId)}` : ""}` +
-            `?uploadType=resumable&supportsAllDrives=true` +
-            `&fields=${encodeURIComponent(UPLOAD_FIELDS)}`;
-          const metadata: Record<string, unknown> = {};
-          if (name) metadata.name = name;
-          if (!fileId && parentId) metadata.parents = [parentId];
-
-          const res = await fetch(url, {
-            method: fileId ? "PATCH" : "POST",
-            headers: {
-              Authorization: `Bearer ${token}`,
-              "Content-Type": "application/json; charset=UTF-8",
-              "X-Upload-Content-Type": resolvedMime,
-              ...(sizeBytes ? { "X-Upload-Content-Length": String(sizeBytes) } : {}),
-            },
-            body: JSON.stringify(metadata),
-          });
-          if (!res.ok) {
-            return { name: label, fileId: fileId ?? null, error: `Google returned ${res.status}: ${await errorBody(res)}` };
-          }
-          const uploadUrl = res.headers.get("location");
-          if (!uploadUrl) {
-            return {
-              name: label,
-              fileId: fileId ?? null,
-              error: "Google did not return a resumable session URI (no Location header).",
-            };
-          }
-          const total = sizeBytes ? String(sizeBytes) : "*";
-          const lastByte = sizeBytes ? String(sizeBytes - 1) : "<end>";
-          const howTo =
-            `PUT the raw bytes to uploadUrl with headers "Content-Type: ${resolvedMime}" and ` +
-            `"Content-Range: bytes 0-${lastByte}/${total}"` +
-            (sizeBytes
-              ? " (a single PUT of the whole file is fine). "
-              : " — the total size is unknown, so keep sending '*' as the total and put the " +
-                "real total in the Content-Range of the FINAL chunk to finalise the upload. ") +
-            "Then call drive_confirm_upload with the same uploadUrl.";
-          return {
-            name: name ?? null,
-            fileId: fileId ?? null,
-            mode: fileId ? ("replace" as const) : ("create" as const),
-            uploadUrl,
-            mimeType: resolvedMime,
-            sizeBytes: sizeBytes ?? null,
-            expiresAt,
-            howTo,
-          };
-        } catch (e: unknown) {
-          return { name: label, fileId: fileId ?? null, error: e instanceof Error ? e.message : String(e) };
-        }
-      });
-      // Honest limit (STANDARD §15.1 Q20, same convention as sheets-mcp's
-      // raw_batch_update): the actual bytes travel via a LATER, out-of-band
-      // client→Google PUT this server never sees, so nothing here can
-      // confirm content landed — that is what drive_confirm_upload is for.
-      // This only confirms the session-creation call itself succeeded.
-      return buildMutationResult({
-        results,
-        total: payload.files.length,
-        verb: "Created session(s) for",
-        summaryIcon: "⬆️",
-        verify: async (r) =>
-          r.uploadUrl
-            ? {
-                outcome: "warn",
-                line: `- ⚠️ **«${safeText(r.name ?? r.fileId ?? "", 60)}»** — сессия создана; фактическая загрузка байт идёт напрямую клиент→Google и не проверяется этим вызовом, используйте drive_confirm_upload`,
-              }
-            : { outcome: "warn", line: `- ⚠️ **«${safeText(r.name ?? r.fileId ?? "", 60)}»** — сессия не создана` },
-        reportTitle: "Независимая проверка создания сессии загрузки",
-        reportSubtitle: "честный предел: содержимое проверяется отдельно через drive_confirm_upload",
-        consentStore,
-        auditId,
-      });
+      return executeUploadSessionCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -1625,32 +2106,6 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
   // content honestly recorded, even though Drive itself keeps no old-content
   // backup here).
 
-  interface OverwriteItem {
-    fileId: string;
-    mimeType?: string;
-    content_text?: string;
-    content_base64?: string;
-  }
-  interface OverwritePayload {
-    account: string;
-    files: OverwriteItem[];
-  }
-
-  async function overwriteBindingSnapshot(g: GoogleClients, files: OverwriteItem[]) {
-    return mapWithLimit(files, async (f) => {
-      const meta = await liveFileMeta(g, f.fileId);
-      return {
-        fileId: f.fileId,
-        mimeType: f.mimeType,
-        name: meta?.name ?? null,
-        liveMimeType: meta?.mimeType ?? null,
-        md5Checksum: meta?.md5Checksum ?? null,
-        modifiedTime: meta?.modifiedTime ?? null,
-        size: meta?.size ?? null,
-      };
-    });
-  }
-
   server.registerTool(
     "drive_overwrite_file",
     {
@@ -1722,58 +2177,14 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           const objectHash = sha256({ account: accountName, files: snapshot });
           return { payload, objectHash, preview, batchSize: files.length };
         },
-        rehash: async (addressing) => {
-          const a = addressing as OverwritePayload;
-          const snapshot = await overwriteBindingSnapshot(g, a.files);
-          return sha256({ account: a.account, files: snapshot });
-        },
+        rehash: (addressing) => overwriteRehash(g, addressing),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      const preSnapshot = await overwriteBindingSnapshot(g, payload.files);
-      interface OverwriteResult {
-        fileId: string;
-        name: string | null;
-        error?: string;
-      }
-      const results = await mapWithLimit<OverwriteItem, OverwriteResult>(payload.files, async ({ fileId, mimeType, content_text, content_base64 }) => {
-        try {
-          if (!content_text && !content_base64) {
-            return { fileId, name: null, error: "Provide either content_text or content_base64." };
-          }
-          const buffer = content_base64
-            ? Buffer.from(content_base64, "base64")
-            : Buffer.from(content_text ?? "", "utf8");
-          const mediaMimeType = mimeType ?? "application/octet-stream";
-          const res = await g.drive.files.update({
-            fileId,
-            requestBody: {},
-            media: { mimeType: mediaMimeType, body: Readable.from(buffer) },
-            fields: "id,name",
-          });
-          return { fileId, name: res.data.name ?? null };
-        } catch (e: unknown) {
-          return { fileId, name: null, error: e instanceof Error ? e.message : String(e) };
-        }
-      });
-      return buildMutationResult({
-        results,
-        total: payload.files.length,
-        verb: "Overwrote",
-        summaryIcon: "♻️",
-        verify: (r) => {
-          const before = preSnapshot.find((s) => s.fileId === r.fileId) ?? null;
-          return postVerifyOverwritten(g, r.fileId, before, r.name ?? r.fileId);
-        },
-        reportTitle: "Независимая проверка перезаписи",
-        reportSubtitle: "запрошено ⇄ живые метаданные Drive",
-        consentStore,
-        auditId,
-        preSnapshot,
-      });
+      return executeOverwriteCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -2068,32 +2479,6 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
   // per Maksim's decision (access to files!) — post-verify below RE-READS
   // permissions.list, it does not just trust the create() response.
 
-  interface ShareItem {
-    fileId: string;
-    role: "reader" | "commenter" | "writer" | "fileOrganizer" | "organizer" | "owner";
-    type: "user" | "group" | "domain" | "anyone";
-    emailAddress?: string;
-    domain?: string;
-    sendNotificationEmail?: boolean;
-    emailMessage?: string;
-    transferOwnership?: boolean;
-  }
-  interface SharePayload {
-    account: string;
-    items: ShareItem[];
-  }
-
-  async function shareBindingSnapshot(g: GoogleClients, items: Array<{ fileId: string }>) {
-    return mapWithLimit(items, async (it) => {
-      const [meta, perms] = await Promise.all([liveFileMeta(g, it.fileId), livePermissions(g, it.fileId)]);
-      return {
-        fileId: it.fileId,
-        name: meta?.name ?? null,
-        permissions: perms ?? [],
-      };
-    });
-  }
-
   server.registerTool(
     "drive_share",
     {
@@ -2200,76 +2585,14 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           const objectHash = sha256({ account: accountName, items, snapshot });
           return { payload, objectHash, preview, batchSize: items.length };
         },
-        rehash: async (addressing) => {
-          const a = addressing as SharePayload;
-          const snapshot = await shareBindingSnapshot(g, a.items);
-          return sha256({ account: a.account, items: a.items, snapshot });
-        },
+        rehash: (addressing) => shareRehash(g, addressing),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      interface ShareResult {
-        fileId: string;
-        role: string;
-        type: string;
-        emailAddress: string | null;
-        domain: string | null;
-        permissionId: string | null;
-        error?: string;
-      }
-      const results = await mapWithLimit<ShareItem, ShareResult>(
-        payload.items,
-        async ({ fileId, role, type, emailAddress, domain, sendNotificationEmail, emailMessage, transferOwnership }) => {
-          try {
-            const res = await g.drive.permissions.create({
-              fileId,
-              sendNotificationEmail: sendNotificationEmail ?? false,
-              emailMessage,
-              transferOwnership: transferOwnership ?? false,
-              requestBody: { role, type, emailAddress, domain },
-              fields: "id,role,type,emailAddress",
-            });
-            return {
-              fileId,
-              role,
-              type,
-              emailAddress: emailAddress ?? null,
-              domain: domain ?? null,
-              permissionId: res.data.id ?? null,
-            };
-          } catch (e: unknown) {
-            return {
-              fileId,
-              role,
-              type,
-              emailAddress: emailAddress ?? null,
-              domain: domain ?? null,
-              permissionId: null,
-              error: e instanceof Error ? e.message : String(e),
-            };
-          }
-        },
-      );
-      return buildMutationResult({
-        results,
-        total: payload.items.length,
-        verb: "Shared",
-        summaryIcon: "✅",
-        verify: (r) =>
-          postVerifyPermissionGranted(
-            g,
-            r.fileId,
-            { type: r.type, role: r.role, emailAddress: r.emailAddress ?? undefined, domain: r.domain ?? undefined },
-            r.fileId,
-          ),
-        reportTitle: "Независимая проверка открытия доступа",
-        reportSubtitle: "запрошено ⇄ живые permissions Drive",
-        consentStore,
-        auditId,
-      });
+      return executeShareCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -2277,15 +2600,6 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
   // REAL binding: re-reads each target's LIVE permission list at plan and
   // again at rehash — a concurrent revoke (or the file itself changing)
   // between plan and execute trips the drift check.
-
-  interface UnshareItem {
-    fileId: string;
-    permissionId: string;
-  }
-  interface UnsharePayload {
-    account: string;
-    items: UnshareItem[];
-  }
 
   server.registerTool(
     "drive_unshare",
@@ -2354,41 +2668,14 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           const objectHash = sha256({ account: accountName, items, snapshot });
           return { payload, objectHash, preview, batchSize: items.length };
         },
-        rehash: async (addressing) => {
-          const a = addressing as UnsharePayload;
-          const snapshot = await shareBindingSnapshot(g, a.items);
-          return sha256({ account: a.account, items: a.items, snapshot });
-        },
+        rehash: (addressing) => unshareRehash(g, addressing),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      interface UnshareResult {
-        fileId: string;
-        permissionId: string;
-        error?: string;
-      }
-      const results = await mapWithLimit<UnshareItem, UnshareResult>(payload.items, async ({ fileId, permissionId }) => {
-        try {
-          await g.drive.permissions.delete({ fileId, permissionId });
-          return { fileId, permissionId };
-        } catch (e: unknown) {
-          return { fileId, permissionId, error: e instanceof Error ? e.message : String(e) };
-        }
-      });
-      return buildMutationResult({
-        results,
-        total: payload.items.length,
-        verb: "Removed",
-        summaryIcon: "🔒",
-        verify: (r) => postVerifyPermissionRemoved(g, r.fileId, r.permissionId, r.fileId),
-        reportTitle: "Независимая проверка отзыва доступа",
-        reportSubtitle: "запрошено ⇄ живые permissions Drive",
-        consentStore,
-        auditId,
-      });
+      return executeUnshareCore(g, payload, auditId, consentStore);
     }),
   );
 

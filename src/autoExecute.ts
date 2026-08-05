@@ -26,7 +26,17 @@ export interface AutoExecutorCtx {
   consentStore: ConsentStore;
 }
 
-export type RehashFn = (addressing: ConsentAddressing) => string | Promise<string>;
+/**
+ * Ctx-параметр добавлен (Максим, drive.ts перевод 2026-08-05) поверх
+ * исходного gmail_send-only контракта: `gmail_send`'s rehash — вырожденный
+ * случай (`sha256(payload)`, без похода в живой мир), так что он не нуждался
+ * в `ctx`. Большинство drive_*-тулов используют РЕАЛЬНЫЙ rehash (перечитывают
+ * живой Drive через `GoogleClients`, который нужно резолвить per-account —
+ * см. `../tools/drive.ts`'s `Rehash`-хелперы), поэтому здесь и нужен `ctx` —
+ * без него drive-тулы физически не могли бы сходить в живой мир из
+ * авто-пути. `http.ts`'s `runAutoExecutePoller` передаёт его при вызове.
+ */
+export type RehashFn = (addressing: ConsentAddressing, ctx: AutoExecutorCtx) => string | Promise<string>;
 /** Возвращает ГОТОВЫЙ человекочитаемый текст отчёта — то же самое, что тул
  * вернул бы модели в чат при обычном (не-авто) исполнении, включая ссылку/
  * артефакт, если тул её производит (см. `_extractText` в http.ts). */

@@ -128,7 +128,11 @@ async function runAutoExecutePoller(config: Config): Promise<void> {
     try {
       const result = await tryAutoExecute(
         { manifestId: c.manifestId, tool: c.tool, accountLabel: c.accountLabel },
-        executor.rehash,
+        // executor.rehash теперь принимает ctx (см. autoExecute.ts's RehashFn
+        // doc-comment) — tryAutoExecute сам знает только про (addressing) =>
+        // ..., так что оборачиваем здесь, где `clients` для этого тика уже
+        // построен.
+        (addressing) => executor.rehash(addressing, { clients, consentStore: consentStoreAdapter }),
         consentStoreAdapter,
         consentServerConfig,
       );
