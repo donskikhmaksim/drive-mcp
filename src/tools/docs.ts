@@ -3,6 +3,7 @@
  */
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { docs_v1 } from "googleapis";
 import { ok, fail, guard, safeText } from "../util.js";
 import { accountField, type UserClients } from "../accounts.js";
@@ -11,6 +12,8 @@ import {
   requireConsent,
   sha256,
   USER_REPLY_DOC,
+  type ConsentStore,
+  type ConsentAddressing,
 } from "../consent.js";
 import {
   type DriveConsentContext,
@@ -18,6 +21,7 @@ import {
   buildMutationResult,
   type VerifyLine,
 } from "./drive.js";
+import { registerAutoExecutor, type AutoExecutorCtx } from "../autoExecute.js";
 
 /** Flattens a Docs document body into plain text. */
 export function documentToPlainText(doc: docs_v1.Schema$Document): string {
@@ -151,7 +155,393 @@ async function postVerifyRawBatchApplied(g: GoogleClients, documentId: string): 
   };
 }
 
+// ── Payload shapes for the 5 gated write tools ───────────────────────────────
+// Lifted to module scope (were previously declared inside registerDocsTools)
+// so the extracted `executeXxxCore`/`rehashXxx` functions below — used BOTH
+// by the normal MCP tool handler and by `registerAutoExecutor` (auto-execute
+// on a Telegram-button click, see autoExecute.ts's doc-comment) — can
+// reference them.
+
+interface CreateDocPayload {
+  account: string;
+  title: string;
+  text?: string;
+}
+
+interface AppendTextPayload {
+  account: string;
+  documentId: string;
+  text: string;
+}
+
+interface InsertTextPayload {
+  account: string;
+  documentId: string;
+  index: number;
+  text: string;
+}
+
+interface ReplaceTextPayload {
+  account: string;
+  documentId: string;
+  find: string;
+  replace: string;
+  matchCase: boolean;
+}
+
+interface RawBatchUpdatePayload {
+  account: string;
+  documentId: string;
+  requests: Record<string, unknown>[];
+}
+
+// ── UserClients tracker for the auto-execute path ────────────────────────────
+// `registerAutoExecutor(...)` below is called at MODULE scope (import time,
+// per autoExecute.ts's doc-comment — must NOT live inside `registerDocsTools`,
+// which re-runs per MCP session). Its `execute` gets a fresh `UserClients` via
+// `AutoExecutorCtx` (the poller builds one per tick, see http.ts's
+// `runAutoExecutePoller`), but `rehash` does NOT — `RehashFn` is
+// `(addressing) => string | Promise<string>`, a single argument, because
+// `tryAutoExecute()` in consent.ts calls it directly with no ctx (see its
+// call site in http.ts). `docs_create`'s rehash is degenerate (no live read,
+// same reasoning as gmail_send — see below) so it doesn't need this. The other
+// 4 tools' rehash DOES need a live `g.docs.documents.get(...)` read (gate.md
+// §3.3(2) REAL binding, unchanged from before this refactor) — for that it
+// needs *some* `UserClients` to resolve an account into a `GoogleClients`.
+//
+// Solution: `registerDocsTools` (called at least once, by `server.ts`'s
+// `buildMcpServer`, before any tool call can exist — and therefore before any
+// consent manifest the poller could ever pick up) stashes the `UserClients`
+// it was given here. The auto-execute rehash functions reuse it. This is the
+// same underlying OAuth-backed `GoogleClients` the interactive path uses, not
+// a re-derivation — cheap and correct for this server's single-tenant-per-
+// process deployment model (mirrors the poller's own `config.users[0]`
+// fallback in http.ts).
+let lastClients: UserClients | undefined;
+
+function requireLastClients(): UserClients {
+  if (!lastClients) {
+    throw new Error(
+      "docs: авто-исполнение вызвано раньше первой регистрации инструментов (registerDocsTools ни разу не " +
+        "вызывался в этом процессе) — нет UserClients, чтобы перечитать живое состояние документа.",
+    );
+  }
+  return lastClients;
+}
+
+// ── Shared rehash functions (gate.md §3.3(2) binding) ────────────────────────
+// Each is used BOTH as the `rehash` passed to `requireConsent()` in the
+// tool body (closure over the request's own `clients`) AND as the `rehash`
+// registered with `registerAutoExecutor()` (closure over `requireLastClients()`)
+// — literally the same function, just handed a different `UserClients`. This
+// is what keeps the auto-execute path's binding check exactly as strong as
+// the interactive path's (mcp-development-standard requirement).
+
+/** Degenerate binding (gate.md §3.3(2) honest exception, same as
+ * drive_create_folder/gmail_send): a document that doesn't exist yet has no
+ * live object to bind against, so objectHash = sha256(payload) on both sides. */
+function rehashCreateDoc(addressing: ConsentAddressing): string {
+  return sha256(addressing as CreateDocPayload);
+}
+
+/** REAL binding: re-reads the document's LIVE end-index — a concurrent edit
+ * that shifts the body length between plan and execute trips the drift check. */
+async function rehashAppendText(clients: UserClients, addressing: ConsentAddressing): Promise<string> {
+  const a = addressing as AppendTextPayload;
+  const g = clients.resolve(a.account);
+  const doc = await g.docs.documents.get({ documentId: a.documentId }).catch(() => null);
+  const endIndex = doc ? documentEndIndex(doc.data) : null;
+  return sha256({ account: a.account, documentId: a.documentId, text: a.text, endIndex });
+}
+
+/** REAL binding: re-reads the document's LIVE length/end-index — a concurrent
+ * edit changes the snapshot and trips drift. */
+async function rehashInsertText(clients: UserClients, addressing: ConsentAddressing): Promise<string> {
+  const a = addressing as InsertTextPayload;
+  const g = clients.resolve(a.account);
+  const doc = await g.docs.documents.get({ documentId: a.documentId }).catch(() => null);
+  const liveEnd = doc ? documentEndIndex(doc.data) : null;
+  return sha256({ account: a.account, documentId: a.documentId, index: a.index, text: a.text, liveEnd });
+}
+
+/** REAL binding: a live dry-count of `find` occurrences — a concurrent edit
+ * that changes the occurrence count trips the drift check. */
+async function rehashReplaceText(clients: UserClients, addressing: ConsentAddressing): Promise<string> {
+  const a = addressing as ReplaceTextPayload;
+  const g = clients.resolve(a.account);
+  const text = await liveDocText(g, a.documentId);
+  const count = text ? text.split(a.find).length - 1 : 0;
+  return sha256({
+    account: a.account,
+    documentId: a.documentId,
+    find: a.find,
+    replace: a.replace,
+    matchCase: a.matchCase,
+    count,
+  });
+}
+
+/** Degenerate-ish binding: an arbitrary batchUpdate request has no generic
+ * way to predict what it will touch ahead of time, so binding is on the
+ * document's live title + the exact requests (a rename/delete of the
+ * document between plan and execute still trips drift via the title check). */
+async function rehashRawBatchUpdate(clients: UserClients, addressing: ConsentAddressing): Promise<string> {
+  const a = addressing as RawBatchUpdatePayload;
+  const g = clients.resolve(a.account);
+  const title = await liveDocTitle(g, a.documentId);
+  return sha256({ account: a.account, documentId: a.documentId, requests: a.requests, title });
+}
+
+// ── Execution cores (auto-execution package, Максим 2026-08-05) ─────────────
+// Extracted from each tool's body (the code that used to run after the
+// `decision.kind === "planned"/"refused"` early returns) so it can be called
+// BOTH from the normal MCP tool handler (model calls execute a second time)
+// AND from the background auto-execute poller (Telegram button triggers this
+// directly, with no model involved at all — see autoExecute.ts's doc-comment
+// on why this is a plain function, not an MCP tool parameter). No behaviour
+// changed — pure extract-function refactor.
+
+async function executeCreateDocCore(
+  g: GoogleClients,
+  payload: CreateDocPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  let created: { documentId: string; title: string | null; error?: string };
+  try {
+    const res = await g.docs.documents.create({ requestBody: { title: payload.title } });
+    const documentId = res.data.documentId!;
+    if (payload.text) {
+      await g.docs.documents.batchUpdate({
+        documentId,
+        requestBody: { requests: [{ insertText: { location: { index: 1 }, text: payload.text } }] },
+      });
+    }
+    created = { documentId, title: res.data.title ?? payload.title };
+  } catch (e: unknown) {
+    created = { documentId: "", title: null, error: e instanceof Error ? e.message : String(e) };
+  }
+  return buildMutationResult({
+    results: [created],
+    total: 1,
+    verb: "Created",
+    summaryIcon: "📄",
+    verify: (r) => postVerifyDocIdentity(g, r.documentId, r.title ?? payload.title),
+    reportTitle: "Независимая проверка создания документа",
+    reportSubtitle: "запрошено ⇄ живые документы Docs",
+    consentStore,
+    auditId,
+  });
+}
+
+async function executeAppendTextCore(
+  g: GoogleClients,
+  payload: AppendTextPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  let result: { documentId: string; title: string | null; error?: string };
+  try {
+    const doc = await g.docs.documents.get({ documentId: payload.documentId });
+    const index = documentEndIndex(doc.data);
+    await g.docs.documents.batchUpdate({
+      documentId: payload.documentId,
+      requestBody: { requests: [{ insertText: { location: { index }, text: payload.text } }] },
+    });
+    result = { documentId: payload.documentId, title: doc.data.title ?? null };
+  } catch (e: unknown) {
+    result = { documentId: payload.documentId, title: null, error: e instanceof Error ? e.message : String(e) };
+  }
+  return buildMutationResult({
+    results: [result],
+    total: 1,
+    verb: "Appended",
+    summaryIcon: "📝",
+    verify: (r) => postVerifyTextContains(g, r.documentId, payload.text, r.title ?? r.documentId),
+    reportTitle: "Независимая проверка добавления текста",
+    reportSubtitle: "запрошено ⇄ живой текст документа",
+    consentStore,
+    auditId,
+  });
+}
+
+async function executeInsertTextCore(
+  g: GoogleClients,
+  payload: InsertTextPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  let result: { documentId: string; title: string | null; error?: string };
+  try {
+    let docTitle: string | null = null;
+    try {
+      const meta = await g.docs.documents.get({ documentId: payload.documentId });
+      docTitle = meta.data.title ?? null;
+    } catch {}
+    await g.docs.documents.batchUpdate({
+      documentId: payload.documentId,
+      requestBody: { requests: [{ insertText: { location: { index: payload.index }, text: payload.text } }] },
+    });
+    result = { documentId: payload.documentId, title: docTitle };
+  } catch (e: unknown) {
+    result = { documentId: payload.documentId, title: null, error: e instanceof Error ? e.message : String(e) };
+  }
+  return buildMutationResult({
+    results: [result],
+    total: 1,
+    verb: "Inserted",
+    summaryIcon: "📝",
+    verify: (r) => postVerifyTextContains(g, r.documentId, payload.text, r.title ?? r.documentId),
+    reportTitle: "Независимая проверка вставки текста",
+    reportSubtitle: "запрошено ⇄ живой текст документа",
+    consentStore,
+    auditId,
+  });
+}
+
+async function executeReplaceTextCore(
+  g: GoogleClients,
+  payload: ReplaceTextPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  let result: { documentId: string; title: string | null; occurrencesChanged: number; error?: string };
+  try {
+    let docTitle: string | null = null;
+    try {
+      const meta = await g.docs.documents.get({ documentId: payload.documentId });
+      docTitle = meta.data.title ?? null;
+    } catch {}
+    const res = await g.docs.documents.batchUpdate({
+      documentId: payload.documentId,
+      requestBody: {
+        requests: [
+          {
+            replaceAllText: {
+              containsText: { text: payload.find, matchCase: payload.matchCase },
+              replaceText: payload.replace,
+            },
+          },
+        ],
+      },
+    });
+    const occurrencesChanged = res.data.replies?.[0]?.replaceAllText?.occurrencesChanged ?? 0;
+    result = { documentId: payload.documentId, title: docTitle, occurrencesChanged };
+  } catch (e: unknown) {
+    result = {
+      documentId: payload.documentId,
+      title: null,
+      occurrencesChanged: 0,
+      error: e instanceof Error ? e.message : String(e),
+    };
+  }
+  return buildMutationResult({
+    results: [result],
+    total: 1,
+    verb: "Replaced",
+    summaryIcon: "🔄",
+    verify: (r) => postVerifyReplaced(g, r.documentId, payload.find, payload.replace, r.title ?? r.documentId),
+    reportTitle: "Независимая проверка замены текста",
+    reportSubtitle: "запрошено ⇄ живой текст документа",
+    consentStore,
+    auditId,
+  });
+}
+
+async function executeRawBatchUpdateCore(
+  g: GoogleClients,
+  payload: RawBatchUpdatePayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  let result: { documentId: string; replies?: unknown; error?: string };
+  try {
+    const res = await g.docs.documents.batchUpdate({
+      documentId: payload.documentId,
+      requestBody: { requests: payload.requests as object[] },
+    });
+    result = { documentId: res.data.documentId ?? payload.documentId, replies: res.data.replies };
+  } catch (e: unknown) {
+    result = { documentId: payload.documentId, error: e instanceof Error ? e.message : String(e) };
+  }
+  return buildMutationResult({
+    results: [result],
+    total: 1,
+    verb: "Applied",
+    summaryIcon: "⚙️",
+    verify: (r) => postVerifyRawBatchApplied(g, r.documentId),
+    reportTitle: "Независимая проверка raw batchUpdate",
+    reportSubtitle: "честный предел: содержимое обобщённо не проверяется",
+    consentStore,
+    auditId,
+  });
+}
+
+/** Extracts the human-readable text from a CallToolResult — the same text the
+ * model would have seen in chat, used for the Telegram auto-execution report
+ * (see autoExecute.ts's `ExecuteFn` doc-comment). If a tool's success payload
+ * carries a link (e.g. docs_create's webViewLink), it lives inside this text
+ * because `util.ts`'s `ok()` JSON.stringifies non-string data into it. */
+function extractText(result: CallToolResult): string {
+  const first = result.content?.[0];
+  return first && first.type === "text" ? first.text : JSON.stringify(result);
+}
+
+// ── Auto-execute registrations (module scope — see doc-comment on
+// `lastClients` above for why this must NOT move inside registerDocsTools) ──
+
+registerAutoExecutor("docs_create", {
+  rehash: rehashCreateDoc,
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as CreateDocPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeCreateDocCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+registerAutoExecutor("docs_append_text", {
+  rehash: (addressing) => rehashAppendText(requireLastClients(), addressing),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as AppendTextPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeAppendTextCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+registerAutoExecutor("docs_insert_text", {
+  rehash: (addressing) => rehashInsertText(requireLastClients(), addressing),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as InsertTextPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeInsertTextCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+registerAutoExecutor("docs_replace_text", {
+  rehash: (addressing) => rehashReplaceText(requireLastClients(), addressing),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as ReplaceTextPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeReplaceTextCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+registerAutoExecutor("docs_raw_batch_update", {
+  rehash: (addressing) => rehashRawBatchUpdate(requireLastClients(), addressing),
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as RawBatchUpdatePayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeRawBatchUpdateCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
 export function registerDocsTools(server: McpServer, clients: UserClients, ctx: DriveConsentContext = DEFAULT_CONSENT_CTX) {
+  lastClients = clients;
   const account = accountField(clients);
 
   server.registerTool(
@@ -223,12 +613,6 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
   // yet has no live object to bind against, so objectHash = sha256(payload)
   // on BOTH sides. Post-verify is still real: re-fetches the created document.
 
-  interface CreateDocPayload {
-    account: string;
-    title: string;
-    text?: string;
-  }
-
   server.registerTool(
     "docs_create",
     {
@@ -281,38 +665,14 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
           const objectHash = sha256(payload);
           return { payload, objectHash, preview };
         },
-        rehash: async (addressing) => sha256(addressing as CreateDocPayload),
+        rehash: rehashCreateDoc,
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      let created: { documentId: string; title: string | null; error?: string };
-      try {
-        const res = await g.docs.documents.create({ requestBody: { title: payload.title } });
-        const documentId = res.data.documentId!;
-        if (payload.text) {
-          await g.docs.documents.batchUpdate({
-            documentId,
-            requestBody: { requests: [{ insertText: { location: { index: 1 }, text: payload.text } }] },
-          });
-        }
-        created = { documentId, title: res.data.title ?? payload.title };
-      } catch (e: unknown) {
-        created = { documentId: "", title: null, error: e instanceof Error ? e.message : String(e) };
-      }
-      return buildMutationResult({
-        results: [created],
-        total: 1,
-        verb: "Created",
-        summaryIcon: "📄",
-        verify: (r) => postVerifyDocIdentity(g, r.documentId, r.title ?? payload.title),
-        reportTitle: "Независимая проверка создания документа",
-        reportSubtitle: "запрошено ⇄ живые документы Docs",
-        consentStore,
-        auditId,
-      });
+      return executeCreateDocCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -320,12 +680,6 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
   // REAL binding: re-reads the document's LIVE end-index at plan and again at
   // rehash — a concurrent edit that shifts the body length between plan and
   // execute trips the drift check.
-
-  interface AppendTextPayload {
-    account: string;
-    documentId: string;
-    text: string;
-  }
 
   server.registerTool(
     "docs_append_text",
@@ -381,54 +735,20 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
           const objectHash = sha256({ account: accountName, documentId, text, endIndex });
           return { payload, objectHash, preview };
         },
-        rehash: async (addressing) => {
-          const a = addressing as AppendTextPayload;
-          const doc = await g.docs.documents.get({ documentId: a.documentId }).catch(() => null);
-          const endIndex = doc ? documentEndIndex(doc.data) : null;
-          return sha256({ account: a.account, documentId: a.documentId, text: a.text, endIndex });
-        },
+        rehash: (addressing) => rehashAppendText(clients, addressing),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      let result: { documentId: string; title: string | null; error?: string };
-      try {
-        const doc = await g.docs.documents.get({ documentId: payload.documentId });
-        const index = documentEndIndex(doc.data);
-        await g.docs.documents.batchUpdate({
-          documentId: payload.documentId,
-          requestBody: { requests: [{ insertText: { location: { index }, text: payload.text } }] },
-        });
-        result = { documentId: payload.documentId, title: doc.data.title ?? null };
-      } catch (e: unknown) {
-        result = { documentId: payload.documentId, title: null, error: e instanceof Error ? e.message : String(e) };
-      }
-      return buildMutationResult({
-        results: [result],
-        total: 1,
-        verb: "Appended",
-        summaryIcon: "📝",
-        verify: (r) => postVerifyTextContains(g, r.documentId, payload.text, r.title ?? r.documentId),
-        reportTitle: "Независимая проверка добавления текста",
-        reportSubtitle: "запрошено ⇄ живой текст документа",
-        consentStore,
-        auditId,
-      });
+      return executeAppendTextCore(g, payload, auditId, consentStore);
     }),
   );
 
   // ── Insert at index ───────────────────────────────────────────────────────
   // REAL binding: re-reads the document's LIVE length/end-index at plan and
   // again at rehash — a concurrent edit changes the snapshot and trips drift.
-
-  interface InsertTextPayload {
-    account: string;
-    documentId: string;
-    index: number;
-    text: string;
-  }
 
   server.registerTool(
     "docs_insert_text",
@@ -485,44 +805,14 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
           const objectHash = sha256({ account: accountName, documentId, index, text, liveEnd });
           return { payload, objectHash, preview };
         },
-        rehash: async (addressing) => {
-          const a = addressing as InsertTextPayload;
-          const doc = await g.docs.documents.get({ documentId: a.documentId }).catch(() => null);
-          const liveEnd = doc ? documentEndIndex(doc.data) : null;
-          return sha256({ account: a.account, documentId: a.documentId, index: a.index, text: a.text, liveEnd });
-        },
+        rehash: (addressing) => rehashInsertText(clients, addressing),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      let result: { documentId: string; title: string | null; error?: string };
-      try {
-        let docTitle: string | null = null;
-        try {
-          const meta = await g.docs.documents.get({ documentId: payload.documentId });
-          docTitle = meta.data.title ?? null;
-        } catch {}
-        await g.docs.documents.batchUpdate({
-          documentId: payload.documentId,
-          requestBody: { requests: [{ insertText: { location: { index: payload.index }, text: payload.text } }] },
-        });
-        result = { documentId: payload.documentId, title: docTitle };
-      } catch (e: unknown) {
-        result = { documentId: payload.documentId, title: null, error: e instanceof Error ? e.message : String(e) };
-      }
-      return buildMutationResult({
-        results: [result],
-        total: 1,
-        verb: "Inserted",
-        summaryIcon: "📝",
-        verify: (r) => postVerifyTextContains(g, r.documentId, payload.text, r.title ?? r.documentId),
-        reportTitle: "Независимая проверка вставки текста",
-        reportSubtitle: "запрошено ⇄ живой текст документа",
-        consentStore,
-        auditId,
-      });
+      return executeInsertTextCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -530,14 +820,6 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
   // REAL binding: a live dry-count of `find` occurrences, re-read at plan and
   // again at rehash — a concurrent edit that changes the occurrence count
   // trips the drift check.
-
-  interface ReplaceTextPayload {
-    account: string;
-    documentId: string;
-    find: string;
-    replace: string;
-    matchCase: boolean;
-  }
 
   server.registerTool(
     "docs_replace_text",
@@ -597,54 +879,14 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
           const objectHash = sha256({ account: accountName, documentId, find, replace, matchCase: mc, count });
           return { payload, objectHash, preview };
         },
-        rehash: async (addressing) => {
-          const a = addressing as ReplaceTextPayload;
-          const text = await liveDocText(g, a.documentId);
-          const count = text ? text.split(a.find).length - 1 : 0;
-          return sha256({ account: a.account, documentId: a.documentId, find: a.find, replace: a.replace, matchCase: a.matchCase, count });
-        },
+        rehash: (addressing) => rehashReplaceText(clients, addressing),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      let result: { documentId: string; title: string | null; occurrencesChanged: number; error?: string };
-      try {
-        let docTitle: string | null = null;
-        try {
-          const meta = await g.docs.documents.get({ documentId: payload.documentId });
-          docTitle = meta.data.title ?? null;
-        } catch {}
-        const res = await g.docs.documents.batchUpdate({
-          documentId: payload.documentId,
-          requestBody: {
-            requests: [
-              {
-                replaceAllText: {
-                  containsText: { text: payload.find, matchCase: payload.matchCase },
-                  replaceText: payload.replace,
-                },
-              },
-            ],
-          },
-        });
-        const occurrencesChanged = res.data.replies?.[0]?.replaceAllText?.occurrencesChanged ?? 0;
-        result = { documentId: payload.documentId, title: docTitle, occurrencesChanged };
-      } catch (e: unknown) {
-        result = { documentId: payload.documentId, title: null, occurrencesChanged: 0, error: e instanceof Error ? e.message : String(e) };
-      }
-      return buildMutationResult({
-        results: [result],
-        total: 1,
-        verb: "Replaced",
-        summaryIcon: "🔄",
-        verify: (r) => postVerifyReplaced(g, r.documentId, payload.find, payload.replace, r.title ?? r.documentId),
-        reportTitle: "Независимая проверка замены текста",
-        reportSubtitle: "запрошено ⇄ живой текст документа",
-        consentStore,
-        auditId,
-      });
+      return executeReplaceTextCore(g, payload, auditId, consentStore);
     }),
   );
 
@@ -654,12 +896,6 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
   // document's live title + the exact requests (a rename/delete of the
   // document between plan and execute still trips drift via the title
   // check). Post-verify is an HONEST LIMIT (see postVerifyRawBatchApplied).
-
-  interface RawBatchUpdatePayload {
-    account: string;
-    documentId: string;
-    requests: Record<string, unknown>[];
-  }
 
   server.registerTool(
     "docs_raw_batch_update",
@@ -717,38 +953,14 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
           const objectHash = sha256({ account: accountName, documentId, requests, title });
           return { payload, objectHash, preview };
         },
-        rehash: async (addressing) => {
-          const a = addressing as RawBatchUpdatePayload;
-          const title = await liveDocTitle(g, a.documentId);
-          return sha256({ account: a.account, documentId: a.documentId, requests: a.requests, title });
-        },
+        rehash: (addressing) => rehashRawBatchUpdate(clients, addressing),
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
-      let result: { documentId: string; replies?: unknown; error?: string };
-      try {
-        const res = await g.docs.documents.batchUpdate({
-          documentId: payload.documentId,
-          requestBody: { requests: payload.requests as object[] },
-        });
-        result = { documentId: res.data.documentId ?? payload.documentId, replies: res.data.replies };
-      } catch (e: unknown) {
-        result = { documentId: payload.documentId, error: e instanceof Error ? e.message : String(e) };
-      }
-      return buildMutationResult({
-        results: [result],
-        total: 1,
-        verb: "Applied",
-        summaryIcon: "⚙️",
-        verify: (r) => postVerifyRawBatchApplied(g, r.documentId),
-        reportTitle: "Независимая проверка raw batchUpdate",
-        reportSubtitle: "честный предел: содержимое обобщённо не проверяется",
-        consentStore,
-        auditId,
-      });
+      return executeRawBatchUpdateCore(g, payload, auditId, consentStore);
     }),
   );
 }
