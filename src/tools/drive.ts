@@ -96,14 +96,12 @@ export interface DriveConsentContext {
    * off (TG_APPROVAL_ENABLED unset), so a fork without a configured bot is
    * unaffected.
    *
-   * ⚠️ NOT YET WIRED INTO THE GATE ITSELF: unlike gmail-mcp, this repo's
-   * `../consent.js` does not have a `tg?: TgApprovalGate` field on
-   * `RequireConsentParams` nor the `p.tg?.enabledFor(tool)` branches inside
-   * `requireConsent()` — see the honest note on `tgApprovalGate` in
-   * `../server.ts`. This field is populated from `server.ts` and available
-   * on `ctx` for every write tool below, but none of the `requireConsent({
-   * ... })` calls in this file pass `tg: ctx.tg` yet, so setting
-   * TG_APPROVAL_ENABLED=true currently has no runtime effect here.
+   * WIRED (as of the auto-execute-by-button pass, 2026-08-05): `../consent.js`
+   * has the `tg?: TgApprovalGate` field on `RequireConsentParams` and the
+   * `p.tg?.enabledFor(tool)` branches inside `requireConsent()`, and every
+   * `requireConsent({ ... })` call in this file below destructures `tg` from
+   * `ctx` and passes it through (`tg,` shorthand). Setting
+   * TG_APPROVAL_ENABLED=true does have runtime effect here.
    */
   tg?: TgApprovalGate;
 }

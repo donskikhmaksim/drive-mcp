@@ -85,18 +85,13 @@ export const tgApprovalStoreAdapter: TgApprovalStore = {
  * TG_APPROVAL_ENABLED=false) so callers never branch on its presence —
  * `enabledFor()` is simply false for every tool in that case.
  *
- * ⚠️ PORTING GAP (honest note, not a TODO to silently paper over): unlike
- * gmail-mcp, THIS repo's `consent.ts` does not yet have the `tg?:
- * TgApprovalGate` field on `RequireConsentParams` nor the `if
- * (p.tg?.enabledFor(tool))` branches inside `requireConsent()` — that
- * integration was intentionally NOT ported here (out of scope for this pass,
- * per explicit instruction not to touch `consent.ts`). `tgApprovalGate` is
- * wired into `DriveConsentContext.tg` below and IS exercised directly by
- * `tg_approval.ts`'s own tests, but no `drive`/`docs`/`skill_version` write
- * tool actually calls into it yet — setting `TG_APPROVAL_ENABLED=true` today
- * has NO effect on tool behaviour until `consent.ts` gets the matching branch
- * (mirror gmail-mcp's `consent.ts` lines ~143-254/549-654) and each
- * `requireConsent(...)` call site below adds `tg: ctx.tg`.
+ * WIRED (as of the auto-execute-by-button pass, 2026-08-05): `consent.ts` has
+ * the `tg?: TgApprovalGate` field on `RequireConsentParams` and the `if
+ * (p.tg?.enabledFor(tool))` branches inside `requireConsent()`, mirroring
+ * gmail-mcp's `consent.ts`. `tgApprovalGate` is wired into
+ * `DriveConsentContext.tg` below, and every `drive`/`docs`/`skill_version`
+ * write tool's `requireConsent(...)` call passes `tg: ctx.tg` (via
+ * destructuring), so `TG_APPROVAL_ENABLED=true` does affect tool behaviour.
  */
 export const tgApprovalGate: TgApprovalGate = createTgApprovalGate(tgApprovalConfig, tgApprovalStoreAdapter);
 
