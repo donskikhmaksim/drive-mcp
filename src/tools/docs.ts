@@ -252,7 +252,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, title, text, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Создание документа недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -269,6 +269,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!title) {
             throw new Error("Нужен `title`, чтобы построить план создания документа.");
@@ -348,7 +349,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
       },
     },
     guard(async ({ account, documentId, text, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Добавление текста недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -365,6 +366,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!documentId || text === undefined) {
             throw new Error("Нужны `documentId` и `text`, чтобы построить план добавления текста.");
@@ -451,7 +453,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
       },
     },
     guard(async ({ account, documentId, index, text, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Вставка текста недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -468,6 +470,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!documentId || index === undefined || text === undefined) {
             throw new Error("Нужны `documentId`, `index` и `text`, чтобы построить план вставки.");
@@ -561,7 +564,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
       annotations: { destructiveHint: true },
     },
     guard(async ({ account, documentId, find, replace, matchCase, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Замена текста недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -579,6 +582,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!documentId || find === undefined || replace === undefined) {
             throw new Error("Нужны `documentId`, `find` и `replace`, чтобы построить план замены.");
@@ -683,7 +687,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
       annotations: { destructiveHint: true },
     },
     guard(async ({ account, documentId, requests, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Применение raw batchUpdate недоступно: не настроено хранилище согласия (DATABASE_URL). Без него " +
@@ -700,6 +704,7 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!documentId || !requests || !requests.length) {
             throw new Error("Нужны `documentId` и непустой `requests`, чтобы построить план.");

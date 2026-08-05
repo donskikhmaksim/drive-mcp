@@ -135,7 +135,7 @@ export function registerSkillVersionTools(server: McpServer, userClients: UserCl
       annotations: { destructiveHint: false },
     },
     guard(async ({ skill_name, new_version, new_content, date, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Обновление версии навыка недоступно: не настроено хранилище согласия (DATABASE_URL). Без него " +
@@ -152,6 +152,7 @@ export function registerSkillVersionTools(server: McpServer, userClients: UserCl
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!skill_name || !new_version || new_content === undefined) {
             throw new Error("Нужны `skill_name`, `new_version` и `new_content`, чтобы построить план.");

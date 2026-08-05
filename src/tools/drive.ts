@@ -23,6 +23,7 @@ import {
   type ConsentStore,
   type ConsentConfig,
 } from "../consent.js";
+import type { TgApprovalGate } from "../tg_approval.js";
 
 // ── Consent-gate context (shared across drive.ts/docs.ts/skill_version.ts) ──
 // mcp-development-standard/references/gate.md. Defined here (drive.ts, the
@@ -85,6 +86,23 @@ export interface DriveConsentContext {
   /** Read-only access to the consent_audit log. null exactly when Postgres
    * isn't configured (same honest-degradation rule as `consentStore`). */
   auditStore: AuditStore | null;
+  /**
+   * Optional out-of-band Telegram-button approval gate (`../tg_approval.js`,
+   * plan-tg-approval.md). undefined/absent behaves exactly as if this field
+   * didn't exist — `enabledFor()` is false for every tool when the feature is
+   * off (TG_APPROVAL_ENABLED unset), so a fork without a configured bot is
+   * unaffected.
+   *
+   * ⚠️ NOT YET WIRED INTO THE GATE ITSELF: unlike gmail-mcp, this repo's
+   * `../consent.js` does not have a `tg?: TgApprovalGate` field on
+   * `RequireConsentParams` nor the `p.tg?.enabledFor(tool)` branches inside
+   * `requireConsent()` — see the honest note on `tgApprovalGate` in
+   * `../server.ts`. This field is populated from `server.ts` and available
+   * on `ctx` for every write tool below, but none of the `requireConsent({
+   * ... })` calls in this file pass `tg: ctx.tg` yet, so setting
+   * TG_APPROVAL_ENABLED=true currently has no runtime effect here.
+   */
+  tg?: TgApprovalGate;
 }
 
 /** Fallback gate config for callers that don't wire a real one (offline unit
@@ -585,7 +603,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, folders, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Создание папок недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -602,6 +620,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!folders || !folders.length) {
             throw new Error("Нужен непустой `folders`, чтобы построить план создания.");
@@ -706,7 +725,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       annotations: { destructiveHint: false, idempotentHint: true },
     },
     guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Переименование недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -723,6 +742,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план переименования.");
@@ -836,7 +856,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Перемещение недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -853,6 +873,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план перемещения.");
@@ -967,7 +988,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       annotations: { destructiveHint: true },
     },
     guard(async ({ account, fileIds, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Удаление в Корзину недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -984,6 +1005,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!fileIds || !fileIds.length) {
             throw new Error("Нужен непустой `fileIds`, чтобы построить план удаления в Корзину.");
@@ -1104,7 +1126,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, files, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Загрузка недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -1121,6 +1143,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!files || !files.length) {
             throw new Error("Нужен непустой `files`, чтобы построить план загрузки.");
@@ -1295,7 +1318,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       annotations: { destructiveHint: false },
     },
     guard(async ({ account, files, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Создание сессии загрузки недоступно: не настроено хранилище согласия (DATABASE_URL). Без него " +
@@ -1312,6 +1335,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!files || !files.length) {
             throw new Error("Нужен непустой `files`, чтобы построить план создания сессии загрузки.");
@@ -1664,7 +1688,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       annotations: { destructiveHint: true },
     },
     guard(async ({ account, files, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Перезапись недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -1681,6 +1705,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!files || !files.length) {
             throw new Error("Нужен непустой `files`, чтобы построить план перезаписи.");
@@ -2131,7 +2156,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       annotations: { destructiveHint: true },
     },
     guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Открытие доступа недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -2148,6 +2173,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план открытия доступа.");
@@ -2294,7 +2320,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       annotations: { destructiveHint: true },
     },
     guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg } = ctx;
+      const { consentStore, consentCfg, tg } = ctx;
       if (!consentStore) {
         return fail(
           "Отзыв доступа недоступен: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -2311,6 +2337,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         userReply: user_reply,
         store: consentStore,
         cfg: consentCfg,
+        tg,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план отзыва доступа.");

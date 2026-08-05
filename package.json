@@ -11,7 +11,7 @@
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node scripts/test-resumable.mjs && node scripts/test-download-links.mjs && node scripts/test-credential-source.mjs && node scripts/test-consent.mjs && node scripts/test-gate-coverage.mjs && node scripts/test-drive-gate.mjs"
+    "test": "npm run build && node scripts/test-resumable.mjs && node scripts/test-download-links.mjs && node scripts/test-credential-source.mjs && node scripts/test-consent.mjs && node scripts/test-gate-coverage.mjs && node scripts/test-drive-gate.mjs && node scripts/test-tg-approval.mjs && node scripts/test-tg-webhook-gate.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -19,6 +19,7 @@
     "google-auth-library": "^10.7.0",
     "googleapis": "^173.0.0",
     "pg": "^8.22.0",
+    "undici": "6.28.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
