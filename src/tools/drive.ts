@@ -1996,29 +1996,27 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
     },
     guard(async ({ account, fileIds, ocrLanguage }) => {
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        fileIds.map(async (fileId) => {
-          let docId: string | null = null;
-          try {
-            const copy = await g.drive.files.copy({
-              fileId,
-              ocrLanguage,
-              requestBody: { name: "gmcp-ocr-tmp", mimeType: GOOGLE_DOC_MIME },
-              fields: "id",
-            });
-            docId = copy.data.id!;
-            const doc = await g.docs.documents.get({ documentId: docId });
-            const text = documentToPlainText(doc.data);
-            return { fileId, text };
-          } catch (e: unknown) {
-            return { fileId, error: e instanceof Error ? e.message : String(e) };
-          } finally {
-            if (docId) {
-              await g.drive.files.delete({ fileId: docId }).catch(() => {});
-            }
+      const results = await mapWithLimit(fileIds, async (fileId) => {
+        let docId: string | null = null;
+        try {
+          const copy = await g.drive.files.copy({
+            fileId,
+            ocrLanguage,
+            requestBody: { name: "gmcp-ocr-tmp", mimeType: GOOGLE_DOC_MIME },
+            fields: "id",
+          });
+          docId = copy.data.id!;
+          const doc = await g.docs.documents.get({ documentId: docId });
+          const text = documentToPlainText(doc.data);
+          return { fileId, text };
+        } catch (e: unknown) {
+          return { fileId, error: e instanceof Error ? e.message : String(e) };
+        } finally {
+          if (docId) {
+            await g.drive.files.delete({ fileId: docId }).catch(() => {});
           }
-        }),
-      );
+        }
+      });
       return ok({
         summary: `📄 Extracted text from ${fileIds.length} file(s) via OCR`,
         results,
