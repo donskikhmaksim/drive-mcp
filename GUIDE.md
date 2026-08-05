@@ -45,7 +45,7 @@
 
 <!-- AUTOGEN:METHODS:BEGIN -->
 
-_Автоматически сгенерировано из кода (18 инструмент(ов)). Не редактируйте вручную — правьте `scripts/gen-guide.mjs`._
+_Автоматически сгенерировано из кода (26 инструмент(ов)). Не редактируйте вручную — правьте `scripts/gen-guide.mjs`._
 
 ### Ищем и читаем файлы
 
@@ -94,5 +94,18 @@ _Автоматически сгенерировано из кода (18 инс�
 | Инструмент | Что делает | Пример запроса |
 | --- | --- | --- |
 | `list_accounts` | Показывает, какие Google-аккаунты подключены. | «Какие аккаунты подключены?» |
+
+### Прочее
+
+| Инструмент | Что делает | Пример запроса |
+| --- | --- | --- |
+| `drive_consent_audit` | Read the consent-gate audit log | — |
+| `docs_list` | List documents | — |
+| `docs_read` | Read document | — |
+| `docs_create` | Create document | — |
+| `docs_append_text` | Append text | — |
+| `docs_insert_text` | Insert text at index | — |
+| `docs_replace_text` | Replace all text | — |
+| `docs_raw_batch_update` | Raw Docs batchUpdate (advanced) | — |
 
 <!-- AUTOGEN:METHODS:END -->

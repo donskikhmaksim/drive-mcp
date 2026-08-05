@@ -1,8 +1,58 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { User } from "./config.js";
+import { loadConsentGateConfig } from "./config.js";
 import { buildUserClients, registerAccountTools } from "./accounts.js";
-import { registerDriveTools } from "./tools/drive.js";
+import { registerDriveTools, type DriveConsentContext } from "./tools/drive.js";
+import { registerDocsTools } from "./tools/docs.js";
 import { registerSkillVersionTools } from "./tools/skill_version.js";
+import type { ConsentStore, ConsentConfig } from "./consent.js";
+import {
+  storeReady,
+  createManifest,
+  getManifest,
+  consumeManifest,
+  invalidateManifest,
+  appendConsentAudit,
+  updateConsentAuditOutcome,
+  listConsentAudit,
+  countConsentAudit,
+} from "./store.js";
+
+/**
+ * store.ts's consent-gate functions (ported from gmail-mcp package A1), typed
+ * against consent.ts's `ConsentStore` here — signature-for-signature by
+ * construction, but the `: ConsentStore` annotation means a drift fails THIS
+ * build, not the tool file's.
+ */
+export const consentStoreAdapter: ConsentStore = {
+  createManifest,
+  getManifest,
+  consumeManifest,
+  invalidateManifest,
+  appendConsentAudit,
+  updateConsentAuditOutcome,
+};
+
+/**
+ * Read-only adapter for `drive_consent_audit` — separate from
+ * `consentStoreAdapter` above (the plan/execute gate contract) since this is
+ * a different, purely-reading surface: "разбор инцидента без ssh"
+ * (limits-audit.md §11).
+ */
+export const auditStoreAdapter = { listConsentAudit, countConsentAudit };
+
+/** This server's identity ($self = "drive") in the shared consent_manifests/
+ * consent_audit tables, plus the gate's TTL/anti-doublet/batch-cap knobs —
+ * env-driven, see `loadConsentGateConfig` in config.ts. `now` is left unset
+ * here (real `Date.now`); consent.ts's `now` injection exists for OFFLINE
+ * UNIT TESTS only. */
+const consentGateEnv = loadConsentGateConfig();
+export const consentServerConfig: ConsentConfig = {
+  server: consentGateEnv.server,
+  consentTtlMs: consentGateEnv.consentTtlMs,
+  minConsentGapMs: consentGateEnv.minConsentGapMs,
+  sendBatchMax: consentGateEnv.sendBatchMax,
+};
 
 export function buildMcpServer(user: User): McpServer {
   const clients = buildUserClients(user);
@@ -14,8 +64,18 @@ export function buildMcpServer(user: User): McpServer {
     { name: "drive-mcp", version: "1.0.0" },
     { instructions: "Tools to organise Google Drive: search, upload, download, move, rename, trash files and folders. " + accountsHint },
   );
+  // Honest degradation (gate.md §3.5): `consentStore`/`auditStore` are null
+  // exactly when Postgres isn't configured — without it there's nowhere to
+  // persist a manifest, so the gated write tools refuse outright rather than
+  // mutate unconfirmed.
+  const consentCtx: DriveConsentContext = {
+    consentStore: storeReady() ? consentStoreAdapter : null,
+    consentCfg: consentServerConfig,
+    auditStore: storeReady() ? auditStoreAdapter : null,
+  };
   registerAccountTools(server, clients);
-  registerDriveTools(server, clients);
-  registerSkillVersionTools(server, clients);
+  registerDriveTools(server, clients, consentCtx);
+  registerDocsTools(server, clients, consentCtx);
+  registerSkillVersionTools(server, clients, consentCtx);
   return server;
 }

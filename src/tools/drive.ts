@@ -5,8 +5,9 @@
 import { z } from "zod";
 import { Readable } from "node:stream";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { ok, fail, guard, isTextual } from "../util.js";
+import { ok, fail, guard, isTextual, safeText, mapWithLimit } from "../util.js";
 import { accountField, type UserClients } from "../accounts.js";
+import type { GoogleClients } from "../google.js";
 import { documentToPlainText } from "./docs.js";
 import {
   issueDownloadLink,
@@ -14,6 +15,395 @@ import {
   DEFAULT_TTL_MINUTES,
   MAX_TTL_MINUTES,
 } from "../downloads.js";
+import {
+  requireConsent,
+  sha256,
+  formatLaTime,
+  USER_REPLY_DOC,
+  type ConsentStore,
+  type ConsentConfig,
+} from "../consent.js";
+
+// ── Consent-gate context (shared across drive.ts/docs.ts/skill_version.ts) ──
+// mcp-development-standard/references/gate.md. Defined here (drive.ts, the
+// main tool file) and re-exported so the other two tool files in this repo
+// thread the SAME context/adapters through — server.ts builds one instance
+// and passes it to all three register*Tools calls.
+
+/** One row of the shared consent_audit log, as read by `drive_consent_audit`.
+ * Mirrors store.ts's `ConsentAuditRow` structurally — same "don't import
+ * store.ts directly, context provides adapters" convention as elsewhere;
+ * `server.ts` wires the real implementation in. */
+export interface ConsentAuditRow {
+  id: string;
+  ts: number;
+  tool: string;
+  accountLabel: string;
+  manifestId?: string | null;
+  objectHash?: string | null;
+  userReply: string;
+  outcome: string;
+  refusalReason?: string | null;
+  actor: string;
+  postVerifyResult: string | null;
+  error: string | null;
+  preSnapshot: unknown;
+}
+
+export interface ConsentAuditFilters {
+  server: string;
+  since?: number;
+  until?: number;
+  accountLabel?: string;
+  tool?: string;
+  outcome?: string;
+}
+
+/** Read-only access to the consent-gate audit log — "разбор инцидента без
+ * ssh" (limits-audit.md §11). Separate from `ConsentStore` above: this is
+ * neither the plan nor the execute gate, just a read path over the same
+ * consent_audit table the gate already writes to. */
+export interface AuditStore {
+  listConsentAudit(filters: ConsentAuditFilters, limit?: number, offset?: number): Promise<ConsentAuditRow[]>;
+  countConsentAudit(filters: ConsentAuditFilters): Promise<number>;
+}
+
+/** Context threaded into `registerDriveTools`/`registerDocsTools`/
+ * `registerSkillVersionTools` carrying the consent-gate wiring (ported from
+ * gmail-mcp's `GmailSnoozeContext` / sheets-mcp's `SheetsConsentContext`). */
+export interface DriveConsentContext {
+  /** Consent-gate storage. null exactly when Postgres isn't configured —
+   * every gated write tool below refuses outright when this is null
+   * (gate.md §3.5: no durable manifest storage means no gate, and that must
+   * never become a silent bypass). */
+  consentStore: ConsentStore | null;
+  /** Gate knobs (TTL / anti-doublet gap / batch cap), always present even
+   * when consentStore is null so a refusal message can still be built
+   * without a crash. Real value comes from `consentServerConfig` in
+   * server.ts (env-driven). */
+  consentCfg: ConsentConfig;
+  /** Read-only access to the consent_audit log. null exactly when Postgres
+   * isn't configured (same honest-degradation rule as `consentStore`). */
+  auditStore: AuditStore | null;
+}
+
+/** Fallback gate config for callers that don't wire a real one (offline unit
+ * tests exercising other tools). Mirrors config.ts's `loadConsentGateConfig()`
+ * defaults; production always gets the real env-driven config from server.ts. */
+const DEFAULT_CONSENT_CFG: ConsentConfig = {
+  server: "drive",
+  consentTtlMs: 3_600_000,
+  minConsentGapMs: 2_000,
+  sendBatchMax: 10,
+};
+
+export const DEFAULT_CONSENT_CTX: DriveConsentContext = {
+  consentStore: null,
+  consentCfg: DEFAULT_CONSENT_CFG,
+  auditStore: null,
+};
+
+// ── Consent-gate machinery (mcp-development-standard/references/gate.md) ───
+// Ported from sheets-mcp's tools/sheets.ts: the same requireConsent/
+// plan→execute wiring, one §5.3 report renderer, and REAL (non-tautological)
+// rehash for every gated write below — each rehash re-reads the LIVE target
+// (file metadata / parents / permissions) at execute time, never
+// `sha256(payload)` in disguise, except where explicitly noted (creating a
+// brand-new object — folder/small-file upload/upload-session-for-a-new-file
+// — has no live object to bind against yet, the same documented degenerate
+// case as gmail_send/sheets_create).
+
+export type PostVerifyOutcome = "ok" | "warn" | "mismatch";
+export interface VerifyLine {
+  outcome: PostVerifyOutcome;
+  line: string;
+}
+
+/** Now, formatted for America/Los_Angeles. */
+export function nowInLA(): string {
+  return new Date().toLocaleString("sv-SE", { timeZone: "America/Los_Angeles" }) + " America/Los_Angeles";
+}
+
+/** Worst outcome across a batch, for choosing the summary status header. */
+export function worstOutcome(results: Array<{ outcome: PostVerifyOutcome }>): PostVerifyOutcome {
+  if (results.some((r) => r.outcome === "mismatch")) return "mismatch";
+  if (results.some((r) => r.outcome === "warn")) return "warn";
+  return "ok";
+}
+
+/** One §5.3 renderer for the whole repo (output-format.md §7.1 p.5: "an
+ * instrument hand-rolling its own status string is a defect"). Exported so
+ * docs.ts/skill_version.ts use the identical renderer. */
+export function renderVerifyReport(title: string, subtitle: string, results: VerifyLine[]): string {
+  const okN = results.filter((r) => r.outcome === "ok").length;
+  const warnN = results.filter((r) => r.outcome === "warn").length;
+  const mmN = results.filter((r) => r.outcome === "mismatch").length;
+  const body = results.map((r) => r.line).join("\n");
+  return (
+    `### 🧾 ${title}\n` +
+    `_${nowInLA()} · ${subtitle}_\n\n` +
+    `${body}\n\n` +
+    `**Итог: ✅ ${okN} подтверждено, ⚠️ ${warnN} не проверено, ❌ ${mmN} расхождение.**\n` +
+    `_[агенту: перепечатай этот отчёт пользователю ДОСЛОВНО — это серверная проверка, не заменяй пересказом]_`
+  );
+}
+
+/**
+ * Aggregates a gated batch mutation's per-item results with REAL independent
+ * post-verify reads: every item without an execute-time `error` gets a fresh
+ * `verify` read, the response header reflects the WORST outcome (never
+ * smoothed to ✅ on a ❌ — §5.3), and the audit row's phase-2 outcome is
+ * filled in via `updateConsentAuditOutcome` so `drive_consent_audit` shows
+ * what actually happened, not just that the human said yes.
+ */
+export async function buildMutationResult<T extends { error?: string }>(opts: {
+  results: T[];
+  total: number;
+  verb: string;
+  summaryIcon: string;
+  verify: (item: T) => Promise<VerifyLine>;
+  reportTitle: string;
+  reportSubtitle: string;
+  consentStore?: ConsentStore;
+  auditId?: string;
+  preSnapshot?: unknown;
+}): Promise<ReturnType<typeof ok>> {
+  const { results, total, verb, summaryIcon, verify, reportTitle, reportSubtitle, consentStore, auditId, preSnapshot } = opts;
+  const succeeded = results.filter((r) => !r.error);
+  const pv = await mapWithLimit(succeeded, (r) => verify(r));
+  const okN = succeeded.length;
+  const failN = total - okN;
+  const worst = worstOutcome(pv);
+  let icon = summaryIcon;
+  let tail = "";
+  if (worst === "mismatch") {
+    icon = "❌";
+    tail = " — РАСХОЖДЕНИЕ при проверке, см. отчёт";
+  } else if (worst === "warn" || failN > 0) {
+    icon = "⚠️";
+    if (failN > 0) tail = ` (${failN} с ошибкой)`;
+  }
+  if (consentStore && auditId) {
+    const errs = results
+      .filter((r): r is T & { error: string } => !!r.error)
+      .map((r) => r.error)
+      .join("; ");
+    await consentStore
+      .updateConsentAuditOutcome(auditId, {
+        outcome: okN > 0 ? "confirmed" : "failed",
+        postVerify:
+          `${icon} ${verb} ${okN}/${total}${tail}` + (pv.length ? ` · post-verify: ${pv.map((p) => p.line).join("; ")}` : ""),
+        error: errs || null,
+        ...(preSnapshot !== undefined ? { preSnapshot } : {}),
+      })
+      .catch((e) => {
+        console.error("[consent audit] updateConsentAuditOutcome failed:", e instanceof Error ? e.message : String(e));
+      });
+  }
+  return ok({
+    summary: `${icon} ${verb} ${okN}/${total}${tail}`,
+    results,
+    ...(pv.length ? { verification: renderVerifyReport(reportTitle, reportSubtitle, pv) } : {}),
+  });
+}
+
+/** Live file metadata (name/mimeType/parents/trashed/md5/modifiedTime/size),
+ * or null if unreadable (deleted/no access). Used BOTH to build the plan-time
+ * binding snapshot AND to re-read the same file at rehash/post-verify time —
+ * the identical function on both sides is what makes the binding a real
+ * drift check, not a tautology (gate.md §3.3(2)). */
+export async function liveFileMeta(g: GoogleClients, fileId: string): Promise<{
+  id: string;
+  name: string;
+  mimeType: string;
+  parents: string[];
+  trashed: boolean;
+  md5Checksum: string | null;
+  modifiedTime: string | null;
+  size: string | null;
+} | null> {
+  try {
+    const res = await g.drive.files.get({
+      fileId,
+      fields: "id,name,mimeType,parents,trashed,md5Checksum,modifiedTime,size",
+    });
+    return {
+      id: res.data.id ?? fileId,
+      name: res.data.name ?? "",
+      mimeType: res.data.mimeType ?? "",
+      parents: res.data.parents ?? [],
+      trashed: !!res.data.trashed,
+      md5Checksum: res.data.md5Checksum ?? null,
+      modifiedTime: res.data.modifiedTime ?? null,
+      size: res.data.size ?? null,
+    };
+  } catch {
+    return null; // deleted / no access — treated as "gone", not a hard crash
+  }
+}
+
+/** Live permission list for a file, or null if unreadable. Used both to seed
+ * the binding at plan time and to re-read it at rehash/post-verify time for
+ * drive_share/drive_unshare — a REAL check of who currently has access, not
+ * `sha256(payload)` in disguise. */
+export async function livePermissions(g: GoogleClients, fileId: string): Promise<Array<{
+  id: string | null;
+  type: string | null;
+  role: string | null;
+  emailAddress: string | null;
+  domain: string | null;
+}> | null> {
+  try {
+    const res = await g.drive.permissions.list({
+      fileId,
+      fields: "permissions(id,type,role,emailAddress,domain)",
+    });
+    return (res.data.permissions ?? []).map((p) => ({
+      id: p.id ?? null,
+      type: p.type ?? null,
+      role: p.role ?? null,
+      emailAddress: p.emailAddress ?? null,
+      domain: p.domain ?? null,
+    }));
+  } catch {
+    return null;
+  }
+}
+
+/** Post-verify: the file still exists and (when a name was requested) still
+ * carries it. Used for rename / trash-target existence / generic identity
+ * confirmation. */
+export async function postVerifyFileIdentity(
+  g: GoogleClients,
+  fileId: string,
+  expectedName: string | null,
+  label: string,
+): Promise<VerifyLine> {
+  const meta = await liveFileMeta(g, fileId);
+  const lbl = safeText(label) || "(файл)";
+  if (meta === null) {
+    return { outcome: "warn", line: `- ⚠️ **«${lbl}»** — не удалось перепроверить файл ${safeText(fileId)}` };
+  }
+  if (expectedName !== null && meta.name !== expectedName) {
+    return { outcome: "mismatch", line: `- ❌ **«${lbl}»** — живое название не совпадает: «${safeText(meta.name)}»` };
+  }
+  return { outcome: "ok", line: `- ✅ **«${safeText(meta.name) || lbl}»** — подтверждено` };
+}
+
+/** Post-verify: file's live `parents` now include `expectedParent` (and, if
+ * given, no longer include `removedParent`). */
+export async function postVerifyParents(
+  g: GoogleClients,
+  fileId: string,
+  expectedParent: string,
+  removedParent: string | undefined,
+  label: string,
+): Promise<VerifyLine> {
+  const meta = await liveFileMeta(g, fileId);
+  const lbl = safeText(label) || "(файл)";
+  if (meta === null) {
+    return { outcome: "warn", line: `- ⚠️ **«${lbl}»** — не удалось перепроверить файл ${safeText(fileId)}` };
+  }
+  const hasNew = meta.parents.includes(expectedParent);
+  const stillHasOld = removedParent ? meta.parents.includes(removedParent) : false;
+  if (!hasNew || stillHasOld) {
+    return {
+      outcome: "mismatch",
+      line: `- ❌ **«${safeText(meta.name) || lbl}»** — живые родители не совпадают (${meta.parents.map((p) => safeText(p, 30)).join(", ") || "—"})`,
+    };
+  }
+  return { outcome: "ok", line: `- ✅ **«${safeText(meta.name) || lbl}»** — перемещено, живой родитель подтверждён` };
+}
+
+/** Post-verify: file is now trashed (or, honestly, unreadable — Drive can
+ * 404 a trashed file for some scopes, reported as ⚠️ not ✅). */
+export async function postVerifyTrashed(g: GoogleClients, fileId: string, label: string): Promise<VerifyLine> {
+  const meta = await liveFileMeta(g, fileId);
+  const lbl = safeText(label) || "(файл)";
+  if (meta === null) {
+    return { outcome: "warn", line: `- ⚠️ **«${lbl}»** — не удалось перепроверить файл ${safeText(fileId)} после удаления в корзину` };
+  }
+  if (!meta.trashed) {
+    return { outcome: "mismatch", line: `- ❌ **«${safeText(meta.name) || lbl}»** — живой файл НЕ в корзине` };
+  }
+  return { outcome: "ok", line: `- ✅ **«${safeText(meta.name) || lbl}»** — в корзине, подтверждено` };
+}
+
+/** Post-verify: file's live content actually changed (md5Checksum or
+ * modifiedTime differs from the pre-mutation snapshot) — the honest signal
+ * that an overwrite actually landed, without re-downloading the bytes. */
+export async function postVerifyOverwritten(
+  g: GoogleClients,
+  fileId: string,
+  before: { md5Checksum: string | null; modifiedTime: string | null } | null,
+  label: string,
+): Promise<VerifyLine> {
+  const meta = await liveFileMeta(g, fileId);
+  const lbl = safeText(label) || "(файл)";
+  if (meta === null) {
+    return { outcome: "warn", line: `- ⚠️ **«${lbl}»** — не удалось перепроверить файл ${safeText(fileId)}` };
+  }
+  const changed =
+    !before ||
+    (before.md5Checksum !== null && meta.md5Checksum !== null && before.md5Checksum !== meta.md5Checksum) ||
+    (before.modifiedTime !== null && meta.modifiedTime !== null && before.modifiedTime !== meta.modifiedTime);
+  if (!changed) {
+    return {
+      outcome: "warn",
+      line: `- ⚠️ **«${safeText(meta.name) || lbl}»** — содержимое выглядит неизменным (не удалось надёжно подтвердить перезапись по md5/modifiedTime)`,
+    };
+  }
+  return { outcome: "ok", line: `- ✅ **«${safeText(meta.name) || lbl}»** — перезаписано, живые метаданные изменились` };
+}
+
+/** Post-verify: a permission matching {type, role, emailAddress?, domain?}
+ * now exists in the file's LIVE permission list. */
+export async function postVerifyPermissionGranted(
+  g: GoogleClients,
+  fileId: string,
+  expected: { type: string; role: string; emailAddress?: string; domain?: string },
+  label: string,
+): Promise<VerifyLine> {
+  const perms = await livePermissions(g, fileId);
+  const lbl = safeText(label) || "(файл)";
+  if (perms === null) {
+    return { outcome: "warn", line: `- ⚠️ **«${lbl}»** — не удалось перепроверить права доступа файла ${safeText(fileId)}` };
+  }
+  const found = perms.some(
+    (p) =>
+      p.type === expected.type &&
+      p.role === expected.role &&
+      (expected.emailAddress ? p.emailAddress === expected.emailAddress : true) &&
+      (expected.domain ? p.domain === expected.domain : true),
+  );
+  if (!found) {
+    return {
+      outcome: "mismatch",
+      line: `- ❌ **«${lbl}»** — среди живых прав доступа НЕТ ожидаемого (${expected.role} для ${safeText(expected.emailAddress ?? expected.domain ?? expected.type)})`,
+    };
+  }
+  return { outcome: "ok", line: `- ✅ **«${lbl}»** — доступ подтверждён среди живых permissions` };
+}
+
+/** Post-verify: `permissionId` is now ABSENT from the file's LIVE permission
+ * list (drive_unshare succeeded). */
+export async function postVerifyPermissionRemoved(
+  g: GoogleClients,
+  fileId: string,
+  permissionId: string,
+  label: string,
+): Promise<VerifyLine> {
+  const perms = await livePermissions(g, fileId);
+  const lbl = safeText(label) || "(файл)";
+  if (perms === null) {
+    return { outcome: "warn", line: `- ⚠️ **«${lbl}»** — не удалось перепроверить права доступа файла ${safeText(fileId)}` };
+  }
+  const stillThere = perms.some((p) => p.id === permissionId);
+  if (stillThere) {
+    return { outcome: "mismatch", line: `- ❌ **«${lbl}»** — право доступа всё ещё в живом списке permissions` };
+  }
+  return { outcome: "ok", line: `- ✅ **«${lbl}»** — доступ отозван, подтверждено среди живых permissions` };
+}
 
 const GOOGLE_DOC_MIME = "application/vnd.google-apps.document";
 
@@ -64,7 +454,7 @@ function withExportExtension(name: string, exportMime: string): string {
   return name + ext;
 }
 
-export function registerDriveTools(server: McpServer, clients: UserClients) {
+export function registerDriveTools(server: McpServer, clients: UserClients, ctx: DriveConsentContext = DEFAULT_CONSENT_CTX) {
   const account = accountField(clients);
 
   // ── Search (no change — already returns multiple) ──────────────────────────
@@ -151,93 +541,274 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
   );
 
   // ── Create folders ─────────────────────────────────────────────────────────
+  // Two-mode consent-gated tool. Degenerate binding (gate.md §3.3(2) honest
+  // exception, same as gmail_send/sheets_create): a folder that doesn't exist
+  // yet has no live object to bind against, so objectHash = sha256(payload)
+  // on BOTH sides. Post-verify is still real: each created folder is
+  // re-fetched by id to confirm it actually exists with the requested name.
+
+  interface CreateFolderItem {
+    name: string;
+    parentId?: string;
+  }
+  interface CreateFolderPayload {
+    account: string;
+    folders: CreateFolderItem[];
+  }
 
   server.registerTool(
     "drive_create_folder",
     {
       title: "Create folders",
-      description: "Create one or more new folders, optionally inside parent folders.",
+      description:
+        "Create one or more new folders, optionally inside parent folders. Two-mode consent-gated tool " +
+        "(mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with `folders`) " +
+        "to build a plan and return a preview — NOTHING is created yet. Show the preview to the user verbatim " +
+        "and wait for their reply. Call again with the returned `manifest_id` and the user's VERBATIM " +
+        "`user_reply` to actually create — the approved batch is read back from the plan, not from whatever " +
+        "`folders` the second call carries.",
       inputSchema: {
         account,
         folders: z
           .array(z.object({ name: z.string(), parentId: z.string().optional() }))
-          .min(1)
-          .describe("Array of folders to create."),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, folders }) => {
+    guard(async ({ account, folders, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = ctx;
+      if (!consentStore) {
+        return fail(
+          "Создание папок недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        folders.map(async ({ name, parentId }) => {
-          try {
-            const res = await g.drive.files.create({
-              requestBody: {
-                name,
-                mimeType: "application/vnd.google-apps.folder",
-                parents: parentId ? [parentId] : undefined,
-              },
-              fields: "id,name,webViewLink",
-            });
-            return { name: res.data.name ?? name, id: res.data.id, webViewLink: res.data.webViewLink };
-          } catch (e: unknown) {
-            return { name, error: e instanceof Error ? e.message : String(e) };
+      const accountName = account ?? clients.defaultName;
+
+      const decision = await requireConsent<CreateFolderPayload>({
+        tool: "drive_create_folder",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: async () => {
+          if (!folders || !folders.length) {
+            throw new Error("Нужен непустой `folders`, чтобы построить план создания.");
           }
-        }),
-      );
-      return ok({
-        summary: `📁 Created ${folders.length} folder(s)`,
+          const payload: CreateFolderPayload = { account: accountName, folders };
+          const lines = folders.map(
+            (f) => `- **«${safeText(f.name, 80)}»**${f.parentId ? ` внутри ${safeText(f.parentId, 40)}` : ""}`,
+          );
+          const preview = `### 📤 План: Создание папок — ${folders.length}\n\n${lines.join("\n")}`;
+          const objectHash = sha256(payload);
+          return { payload, objectHash, preview, batchSize: folders.length };
+        },
+        rehash: async (addressing) => sha256(addressing as CreateFolderPayload),
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      interface CreateFolderResult {
+        name: string;
+        id: string | null;
+        webViewLink: string | null;
+        error?: string;
+      }
+      const results = await mapWithLimit<CreateFolderItem, CreateFolderResult>(payload.folders, async ({ name, parentId }) => {
+        try {
+          const res = await g.drive.files.create({
+            requestBody: {
+              name,
+              mimeType: "application/vnd.google-apps.folder",
+              parents: parentId ? [parentId] : undefined,
+            },
+            fields: "id,name,webViewLink",
+          });
+          return { name: res.data.name ?? name, id: res.data.id ?? null, webViewLink: res.data.webViewLink ?? null };
+        } catch (e: unknown) {
+          return { name, id: null, webViewLink: null, error: e instanceof Error ? e.message : String(e) };
+        }
+      });
+      return buildMutationResult({
         results,
+        total: payload.folders.length,
+        verb: "Created",
+        summaryIcon: "📁",
+        verify: (r) => postVerifyFileIdentity(g, r.id ?? "", r.name, r.name),
+        reportTitle: "Независимая проверка создания папок",
+        reportSubtitle: "запрошено ⇄ живые файлы Drive",
+        consentStore,
+        auditId,
       });
     }),
   );
 
   // ── Rename ─────────────────────────────────────────────────────────────────
+  // REAL binding: re-reads each file's LIVE current name at plan and again at
+  // rehash — a concurrent rename/delete between plan and execute changes the
+  // snapshot and trips the drift check (gate.md §3.3(2)).
+
+  interface RenameItem {
+    fileId: string;
+    newName: string;
+  }
+  interface RenamePayload {
+    account: string;
+    items: RenameItem[];
+  }
+
+  async function renameBindingSnapshot(g: GoogleClients, items: RenameItem[]) {
+    return mapWithLimit(items, async (it) => ({
+      fileId: it.fileId,
+      newName: it.newName,
+      currentName: (await liveFileMeta(g, it.fileId))?.name ?? null,
+    }));
+  }
 
   server.registerTool(
     "drive_rename",
     {
       title: "Rename files",
-      description: "Rename one or more files or folders.",
+      description:
+        "Rename one or more files or folders. Two-mode consent-gated tool " +
+        "(mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with `items`) " +
+        "to build a plan and return a preview — NOTHING is renamed yet. Show the preview to the user verbatim " +
+        "and wait for their reply. Call again with the returned `manifest_id` and the user's VERBATIM " +
+        "`user_reply` to actually rename.",
       inputSchema: {
         account,
         items: z
           .array(z.object({ fileId: z.string(), newName: z.string() }))
-          .min(1)
-          .describe("Array of {fileId, newName} pairs."),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
       annotations: { destructiveHint: false, idempotentHint: true },
     },
-    guard(async ({ account, items }) => {
+    guard(async ({ account, items, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = ctx;
+      if (!consentStore) {
+        return fail(
+          "Переименование недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        items.map(async ({ fileId, newName }) => {
-          try {
-            await g.drive.files.update({
-              fileId,
-              requestBody: { name: newName },
-              fields: "id,name",
-            });
-            return { fileId, newName };
-          } catch (e: unknown) {
-            return { fileId, newName, error: e instanceof Error ? e.message : String(e) };
+      const accountName = account ?? clients.defaultName;
+
+      const decision = await requireConsent<RenamePayload>({
+        tool: "drive_rename",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: async () => {
+          if (!items || !items.length) {
+            throw new Error("Нужен непустой `items`, чтобы построить план переименования.");
           }
-        }),
-      );
-      return ok({
-        summary: `✏️ Renamed ${items.length} file(s)`,
+          const snapshot = await renameBindingSnapshot(g, items);
+          const payload: RenamePayload = { account: accountName, items };
+          const lines = snapshot.map(
+            (s) => `- **«${safeText(s.currentName ?? s.fileId, 60)}»** → «${safeText(s.newName, 60)}»`,
+          );
+          const preview = `### 📤 План: Переименование — ${items.length}\n\n${lines.join("\n")}`;
+          const objectHash = sha256({ account: accountName, items: snapshot });
+          return { payload, objectHash, preview, batchSize: items.length };
+        },
+        rehash: async (addressing) => {
+          const a = addressing as RenamePayload;
+          const snapshot = await renameBindingSnapshot(g, a.items);
+          return sha256({ account: a.account, items: snapshot });
+        },
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      interface RenameResult {
+        fileId: string;
+        newName: string;
+        error?: string;
+      }
+      const results = await mapWithLimit<RenameItem, RenameResult>(payload.items, async ({ fileId, newName }) => {
+        try {
+          await g.drive.files.update({ fileId, requestBody: { name: newName }, fields: "id,name" });
+          return { fileId, newName };
+        } catch (e: unknown) {
+          return { fileId, newName, error: e instanceof Error ? e.message : String(e) };
+        }
+      });
+      return buildMutationResult({
         results,
+        total: payload.items.length,
+        verb: "Renamed",
+        summaryIcon: "✏️",
+        verify: (r) => postVerifyFileIdentity(g, r.fileId, r.newName, r.newName),
+        reportTitle: "Независимая проверка переименования",
+        reportSubtitle: "запрошено ⇄ живые файлы Drive",
+        consentStore,
+        auditId,
       });
     }),
   );
 
   // ── Move ───────────────────────────────────────────────────────────────────
+  // REAL binding: re-reads each file's LIVE current `parents` at plan and
+  // again at rehash — someone else moving the file between plan and execute
+  // changes the snapshot and trips the drift check. Low priority per
+  // Maksim's decision (2026-08-04), still gated like every other write.
+
+  interface MoveItem {
+    fileId: string;
+    newParentId: string;
+    removeParentId?: string;
+  }
+  interface MovePayload {
+    account: string;
+    items: MoveItem[];
+  }
+
+  async function moveBindingSnapshot(g: GoogleClients, items: MoveItem[]) {
+    return mapWithLimit(items, async (it) => ({
+      fileId: it.fileId,
+      newParentId: it.newParentId,
+      removeParentId: it.removeParentId ?? null,
+      currentParents: (await liveFileMeta(g, it.fileId))?.parents ?? [],
+    }));
+  }
 
   server.registerTool(
     "drive_move",
     {
       title: "Move files",
-      description: "Move one or more files into different folders.",
+      description:
+        "Move one or more files into different folders. Two-mode consent-gated tool " +
+        "(mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with `items`) " +
+        "to build a plan and return a preview — NOTHING is moved yet. Show the preview to the user verbatim " +
+        "and wait for their reply. Call again with the returned `manifest_id` and the user's VERBATIM " +
+        "`user_reply` to actually move.",
       inputSchema: {
         account,
         items: z
@@ -251,73 +822,243 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
                 .describe("Current parent folder id to detach from."),
             }),
           )
-          .min(1)
-          .describe("Array of {fileId, newParentId, removeParentId?} items."),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, items }) => {
+    guard(async ({ account, items, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = ctx;
+      if (!consentStore) {
+        return fail(
+          "Перемещение недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        items.map(async ({ fileId, newParentId, removeParentId }) => {
-          try {
-            const res = await g.drive.files.update({
-              fileId,
-              addParents: newParentId,
-              removeParents: removeParentId,
-              fields: "id,name,parents",
-            });
-            return { fileId, newParentId, name: res.data.name, parents: res.data.parents };
-          } catch (e: unknown) {
-            return { fileId, newParentId, error: e instanceof Error ? e.message : String(e) };
+      const accountName = account ?? clients.defaultName;
+
+      const decision = await requireConsent<MovePayload>({
+        tool: "drive_move",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: async () => {
+          if (!items || !items.length) {
+            throw new Error("Нужен непустой `items`, чтобы построить план перемещения.");
           }
-        }),
-      );
-      return ok({
-        summary: `📂 Moved ${items.length} file(s)`,
+          const snapshot = await moveBindingSnapshot(g, items);
+          const payload: MovePayload = { account: accountName, items };
+          const lines = snapshot.map(
+            (s) =>
+              `- **${safeText(s.fileId, 40)}** — сейчас в [${s.currentParents.map((p) => safeText(p, 30)).join(", ") || "—"}] → ${safeText(s.newParentId, 40)}` +
+              (s.removeParentId ? ` (отвязать от ${safeText(s.removeParentId, 40)})` : ""),
+          );
+          const preview = `### 📤 План: Перемещение — ${items.length}\n\n${lines.join("\n")}`;
+          const objectHash = sha256({ account: accountName, items: snapshot });
+          return { payload, objectHash, preview, batchSize: items.length };
+        },
+        rehash: async (addressing) => {
+          const a = addressing as MovePayload;
+          const snapshot = await moveBindingSnapshot(g, a.items);
+          return sha256({ account: a.account, items: snapshot });
+        },
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      interface MoveResult {
+        fileId: string;
+        newParentId: string;
+        name: string | null;
+        parents: string[] | null;
+        error?: string;
+      }
+      const results = await mapWithLimit<MoveItem, MoveResult>(payload.items, async ({ fileId, newParentId, removeParentId }) => {
+        try {
+          const res = await g.drive.files.update({
+            fileId,
+            addParents: newParentId,
+            removeParents: removeParentId,
+            fields: "id,name,parents",
+          });
+          return { fileId, newParentId, name: res.data.name ?? null, parents: res.data.parents ?? null };
+        } catch (e: unknown) {
+          return { fileId, newParentId, name: null, parents: null, error: e instanceof Error ? e.message : String(e) };
+        }
+      });
+      return buildMutationResult({
         results,
+        total: payload.items.length,
+        verb: "Moved",
+        summaryIcon: "📂",
+        verify: (r) => {
+          const item = payload.items.find((it) => it.fileId === r.fileId);
+          return postVerifyParents(g, r.fileId, r.newParentId, item?.removeParentId, r.name ?? r.fileId);
+        },
+        reportTitle: "Независимая проверка перемещения",
+        reportSubtitle: "запрошено ⇄ живые родители Drive",
+        consentStore,
+        auditId,
       });
     }),
   );
 
   // ── Trash ──────────────────────────────────────────────────────────────────
+  // REAL binding: re-reads each file's LIVE {name, parents, trashed} at plan
+  // and again at rehash. Pre-snapshot (identity-postverify.md §5.2): the
+  // plan-time read IS the "before" snapshot of a necessarily-somewhat-
+  // irreversible mutation — captured explicitly and attached to the audit row.
+
+  interface TrashPayload {
+    account: string;
+    fileIds: string[];
+  }
+
+  async function trashBindingSnapshot(g: GoogleClients, fileIds: string[]) {
+    return mapWithLimit(fileIds, async (fileId) => {
+      const meta = await liveFileMeta(g, fileId);
+      return {
+        fileId,
+        name: meta?.name ?? null,
+        parents: meta?.parents ?? [],
+        trashed: meta?.trashed ?? null,
+      };
+    });
+  }
 
   server.registerTool(
     "drive_trash",
     {
       title: "Move files to trash",
       description:
-        "Move one or more files to the trash (reversible). This does NOT permanently delete them.",
+        "Move one or more files to the trash (reversible). This does NOT permanently delete them. Two-mode " +
+        "consent-gated tool (mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` " +
+        "(with `fileIds`) to build a plan and return a preview — NOTHING is trashed yet. Show the preview to the " +
+        "user verbatim and wait for their reply. Call again with the returned `manifest_id` and the user's " +
+        "VERBATIM `user_reply` to actually trash.",
       inputSchema: {
         account,
-        fileIds: z.array(z.string()).min(1).describe("Array of file IDs to trash."),
+        fileIds: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
       annotations: { destructiveHint: true },
     },
-    guard(async ({ account, fileIds }) => {
+    guard(async ({ account, fileIds, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = ctx;
+      if (!consentStore) {
+        return fail(
+          "Удаление в Корзину недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
+            "может провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        fileIds.map(async (fileId) => {
-          try {
-            await g.drive.files.update({
-              fileId,
-              requestBody: { trashed: true },
-              fields: "id,name,trashed",
-            });
-            return { fileId, trashed: true as const };
-          } catch (e: unknown) {
-            return { fileId, error: e instanceof Error ? e.message : String(e) };
+      const accountName = account ?? clients.defaultName;
+
+      const decision = await requireConsent<TrashPayload>({
+        tool: "drive_trash",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: async () => {
+          if (!fileIds || !fileIds.length) {
+            throw new Error("Нужен непустой `fileIds`, чтобы построить план удаления в Корзину.");
           }
-        }),
-      );
-      return ok({
-        summary: `🗑 Trashed ${fileIds.length} file(s)`,
+          const snapshot = await trashBindingSnapshot(g, fileIds);
+          const payload: TrashPayload = { account: accountName, fileIds };
+          const lines = snapshot.map((s) => {
+            if (s.trashed === null) return `- **${safeText(s.fileId, 40)}** — не удалось прочитать живой файл`;
+            if (s.trashed) return `- **«${safeText(s.name ?? s.fileId, 60)}»** — уже в Корзине`;
+            return `- **«${safeText(s.name ?? s.fileId, 60)}»**`;
+          });
+          const preview = `### 📤 План: Удаление в Корзину — ${fileIds.length}\n\n${lines.join("\n")}`;
+          const objectHash = sha256({ account: accountName, fileIds, snapshot });
+          return { payload, objectHash, preview, batchSize: fileIds.length };
+        },
+        rehash: async (addressing) => {
+          const a = addressing as TrashPayload;
+          const snapshot = await trashBindingSnapshot(g, a.fileIds);
+          return sha256({ account: a.account, fileIds: a.fileIds, snapshot });
+        },
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const preSnapshot = await trashBindingSnapshot(g, payload.fileIds);
+      interface TrashResult {
+        fileId: string;
+        trashed: boolean;
+        error?: string;
+      }
+      const results = await mapWithLimit<string, TrashResult>(payload.fileIds, async (fileId) => {
+        try {
+          await g.drive.files.update({ fileId, requestBody: { trashed: true }, fields: "id,name,trashed" });
+          return { fileId, trashed: true as const };
+        } catch (e: unknown) {
+          return { fileId, trashed: false, error: e instanceof Error ? e.message : String(e) };
+        }
+      });
+      return buildMutationResult({
         results,
+        total: payload.fileIds.length,
+        verb: "Trashed",
+        summaryIcon: "🗑",
+        verify: (r) => {
+          const label = preSnapshot.find((s) => s.fileId === r.fileId)?.name ?? r.fileId;
+          return postVerifyTrashed(g, r.fileId, label);
+        },
+        reportTitle: "Независимая проверка удаления в Корзину",
+        reportSubtitle: "запрошено ⇄ живые файлы Drive",
+        consentStore,
+        auditId,
+        preSnapshot,
       });
     }),
   );
 
   // ── Upload ─────────────────────────────────────────────────────────────────
+  // Two-mode consent-gated tool. Degenerate binding (gate.md §3.3(2) honest
+  // exception, same as drive_create_folder above): brand-new files have no
+  // live object to bind against, so objectHash = sha256(payload) on BOTH
+  // sides. Post-verify is still real: each uploaded file is re-fetched by id.
+
+  interface UploadFileItem {
+    name: string;
+    mimeType?: string;
+    parentId?: string;
+    content_text?: string;
+    content_base64?: string;
+  }
+  interface UploadFilePayload {
+    account: string;
+    files: UploadFileItem[];
+  }
 
   server.registerTool(
     "drive_upload_file",
@@ -329,7 +1070,11 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
         "(practical limit ~1 MB). For larger files use drive_create_upload_session + " +
         "drive_confirm_upload, which lets the client PUT the bytes straight to Google. " +
         "To overwrite existing files use drive_overwrite_file instead. " +
-        "Pass either `content_text` (UTF-8) or `content_base64` (binary) per file.",
+        "Pass either `content_text` (UTF-8) or `content_base64` (binary) per file. Two-mode " +
+        "consent-gated tool (mcp-development-standard/references/gate.md): call WITHOUT " +
+        "`manifest_id`/`user_reply` (with `files`) to build a plan and return a preview — NOTHING is created " +
+        "yet. Show the preview to the user verbatim and wait for their reply. Call again with the returned " +
+        "`manifest_id` and the user's VERBATIM `user_reply` to actually upload.",
       inputSchema: {
         account,
         files: z
@@ -345,18 +1090,74 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
               content_base64: z.string().optional(),
             }),
           )
-          .min(1)
-          .describe("Array of files to upload."),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, files }) => {
+    guard(async ({ account, files, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = ctx;
+      if (!consentStore) {
+        return fail(
+          "Загрузка недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        files.map(async ({ name, mimeType, parentId, content_text, content_base64 }) => {
+      const accountName = account ?? clients.defaultName;
+
+      const decision = await requireConsent<UploadFilePayload>({
+        tool: "drive_upload_file",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: async () => {
+          if (!files || !files.length) {
+            throw new Error("Нужен непустой `files`, чтобы построить план загрузки.");
+          }
+          const payload: UploadFilePayload = { account: accountName, files };
+          const lines = files.map((f) => {
+            const bytes = f.content_base64
+              ? Math.ceil((f.content_base64.length * 3) / 4)
+              : Buffer.byteLength(f.content_text ?? "", "utf8");
+            return (
+              `- **«${safeText(f.name, 80)}»** (${f.mimeType ?? "application/octet-stream"}, ~${bytes} байт)` +
+              (f.parentId ? ` внутри ${safeText(f.parentId, 40)}` : "")
+            );
+          });
+          const preview = `### 📤 План: Загрузка файлов — ${files.length}\n\n${lines.join("\n")}`;
+          const objectHash = sha256(payload);
+          return { payload, objectHash, preview, batchSize: files.length };
+        },
+        rehash: async (addressing) => sha256(addressing as UploadFilePayload),
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      interface UploadFileResult {
+        name: string;
+        id: string | null;
+        webViewLink: string | null;
+        error?: string;
+      }
+      const results = await mapWithLimit<UploadFileItem, UploadFileResult>(
+        payload.files,
+        async ({ name, mimeType, parentId, content_text, content_base64 }) => {
           try {
             if (!content_text && !content_base64) {
-              return { name, error: "Provide either content_text or content_base64." };
+              return { name, id: null, webViewLink: null, error: "Provide either content_text or content_base64." };
             }
             const buffer = content_base64
               ? Buffer.from(content_base64, "base64")
@@ -367,20 +1168,61 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
               media: { mimeType: mediaMimeType, body: Readable.from(buffer) },
               fields: "id,name,webViewLink",
             });
-            return { name: res.data.name ?? name, id: res.data.id, webViewLink: res.data.webViewLink };
+            return { name: res.data.name ?? name, id: res.data.id ?? null, webViewLink: res.data.webViewLink ?? null };
           } catch (e: unknown) {
-            return { name, error: e instanceof Error ? e.message : String(e) };
+            return { name, id: null, webViewLink: null, error: e instanceof Error ? e.message : String(e) };
           }
-        }),
+        },
       );
-      return ok({
-        summary: `⬆️ Uploaded ${files.length} file(s)`,
+      return buildMutationResult({
         results,
+        total: payload.files.length,
+        verb: "Uploaded",
+        summaryIcon: "⬆️",
+        verify: (r) => postVerifyFileIdentity(g, r.id ?? "", r.name, r.name),
+        reportTitle: "Независимая проверка загрузки",
+        reportSubtitle: "запрошено ⇄ живые файлы Drive",
+        consentStore,
+        auditId,
       });
     }),
   );
 
   // ── Resumable upload: create session ──────────────────────────────────────
+  // Two-mode consent-gated tool. This is where the gate has to bind, not
+  // drive_confirm_upload: the actual BYTES are PUT by the CLIENT straight to
+  // Google afterwards, bypassing this server entirely — by the time
+  // drive_confirm_upload is called, any replace has already happened. So the
+  // gate covers "starting the upload machinery" (new file OR replace-target
+  // selection), which is the only point this server is actually in the loop.
+  // Binding: for a REPLACE (`fileId` given) this is a REAL rehash of the live
+  // target file's {name, mimeType, md5Checksum} — a concurrent overwrite
+  // between plan and execute trips drift. For a brand-new file (no `fileId`)
+  // there is no live object yet — the same documented degenerate case as
+  // drive_create_folder/drive_upload_file.
+
+  interface UploadSessionItem {
+    name?: string;
+    mimeType?: string;
+    sizeBytes?: number;
+    parentId?: string;
+    fileId?: string;
+  }
+  interface UploadSessionPayload {
+    account: string;
+    files: UploadSessionItem[];
+  }
+
+  async function uploadSessionBindingSnapshot(g: GoogleClients, files: UploadSessionItem[]) {
+    return mapWithLimit(files, async (f) => {
+      if (!f.fileId) return { ...f, liveTarget: null };
+      const meta = await liveFileMeta(g, f.fileId);
+      return {
+        ...f,
+        liveTarget: meta ? { name: meta.name, mimeType: meta.mimeType, md5Checksum: meta.md5Checksum } : null,
+      };
+    });
+  }
 
   server.registerTool(
     "drive_create_upload_session",
@@ -395,7 +1237,11 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
         "stays valid for about a week (see the machine-readable `expiresAt`). Pass `fileId` to " +
         "replace the content of an existing file instead of creating a new one. After the bytes " +
         "are uploaded, call drive_confirm_upload with the same uploadUrl to check status and get " +
-        "the final fileId. Every result carries a `howTo` string with the exact PUT headers.",
+        "the final fileId. Every result carries a `howTo` string with the exact PUT headers. " +
+        "Two-mode consent-gated tool (mcp-development-standard/references/gate.md): call WITHOUT " +
+        "`manifest_id`/`user_reply` (with `files`) to build a plan and return a preview — NO session is created " +
+        "yet. Show the preview to the user verbatim and wait for their reply. Call again with the returned " +
+        "`manifest_id` and the user's VERBATIM `user_reply` to actually create the session(s).",
       inputSchema: {
         account,
         files: z
@@ -435,93 +1281,182 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
                 ),
             }),
           )
-          .min(1)
-          .describe("Array of files to create upload sessions for."),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, files }) => {
+    guard(async ({ account, files, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = ctx;
+      if (!consentStore) {
+        return fail(
+          "Создание сессии загрузки недоступно: не настроено хранилище согласия (DATABASE_URL). Без него " +
+            "сервер не может провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
+      const accountName = account ?? clients.defaultName;
+
+      const decision = await requireConsent<UploadSessionPayload>({
+        tool: "drive_create_upload_session",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: async () => {
+          if (!files || !files.length) {
+            throw new Error("Нужен непустой `files`, чтобы построить план создания сессии загрузки.");
+          }
+          const snapshot = await uploadSessionBindingSnapshot(g, files);
+          const payload: UploadSessionPayload = { account: accountName, files };
+          const lines = snapshot.map((f) => {
+            if (f.fileId) {
+              const live = f.liveTarget;
+              return live
+                ? `- **ЗАМЕНА «${safeText(live.name, 60)}»** (${safeText(f.fileId, 40)}, сейчас ${safeText(live.mimeType, 40)}) — предыдущее содержимое будет потеряно`
+                : `- **ЗАМЕНА ${safeText(f.fileId, 40)}** — не удалось прочитать текущий файл`;
+            }
+            return `- **«${safeText(f.name ?? "(без имени)", 60)}»** — новый файл${f.parentId ? ` внутри ${safeText(f.parentId, 40)}` : ""}`;
+          });
+          const preview = `### 📤 План: Сессия(и) загрузки — ${files.length}\n\n${lines.join("\n")}`;
+          const objectHash = sha256({ account: accountName, files: snapshot });
+          return { payload, objectHash, preview, batchSize: files.length };
+        },
+        rehash: async (addressing) => {
+          const a = addressing as UploadSessionPayload;
+          const snapshot = await uploadSessionBindingSnapshot(g, a.files);
+          return sha256({ account: a.account, files: snapshot });
+        },
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
       const token = await g.accessToken();
       const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-      const results = await Promise.all(
-        files.map(async ({ name, mimeType, sizeBytes, parentId, fileId }) => {
-          const label = name ?? fileId ?? null;
-          try {
-            if (!name && !fileId) {
-              return { name: label, error: "Provide `name` (new file) or `fileId` (replace)." };
-            }
-            if (fileId && parentId) {
-              return {
-                name: label,
-                error: "parentId cannot be combined with fileId — use drive_move to reparent.",
-              };
-            }
-            const resolvedMime = mimeType ?? DEFAULT_UPLOAD_MIME;
-            const url =
-              `${UPLOAD_ENDPOINT}${fileId ? `/${encodeURIComponent(fileId)}` : ""}` +
-              `?uploadType=resumable&supportsAllDrives=true` +
-              `&fields=${encodeURIComponent(UPLOAD_FIELDS)}`;
-            const metadata: Record<string, unknown> = {};
-            if (name) metadata.name = name;
-            if (!fileId && parentId) metadata.parents = [parentId];
-
-            const res = await fetch(url, {
-              method: fileId ? "PATCH" : "POST",
-              headers: {
-                Authorization: `Bearer ${token}`,
-                "Content-Type": "application/json; charset=UTF-8",
-                "X-Upload-Content-Type": resolvedMime,
-                ...(sizeBytes ? { "X-Upload-Content-Length": String(sizeBytes) } : {}),
-              },
-              body: JSON.stringify(metadata),
-            });
-            if (!res.ok) {
-              return { name: label, error: `Google returned ${res.status}: ${await errorBody(res)}` };
-            }
-            const uploadUrl = res.headers.get("location");
-            if (!uploadUrl) {
-              return {
-                name: label,
-                error: "Google did not return a resumable session URI (no Location header).",
-              };
-            }
-            const total = sizeBytes ? String(sizeBytes) : "*";
-            const lastByte = sizeBytes ? String(sizeBytes - 1) : "<end>";
-            const howTo =
-              `PUT the raw bytes to uploadUrl with headers "Content-Type: ${resolvedMime}" and ` +
-              `"Content-Range: bytes 0-${lastByte}/${total}"` +
-              (sizeBytes
-                ? " (a single PUT of the whole file is fine). "
-                : " — the total size is unknown, so keep sending '*' as the total and put the " +
-                  "real total in the Content-Range of the FINAL chunk to finalise the upload. ") +
-              "Then call drive_confirm_upload with the same uploadUrl.";
-            return {
-              name: name ?? null,
-              fileId: fileId ?? null,
-              mode: fileId ? ("replace" as const) : ("create" as const),
-              uploadUrl,
-              mimeType: resolvedMime,
-              sizeBytes: sizeBytes ?? null,
-              expiresAt,
-              howTo,
-            };
-          } catch (e: unknown) {
-            return { name: label, error: e instanceof Error ? e.message : String(e) };
+      interface UploadSessionResult {
+        name: string | null;
+        fileId: string | null;
+        mode?: "create" | "replace";
+        uploadUrl?: string;
+        mimeType?: string;
+        sizeBytes?: number | null;
+        expiresAt?: string;
+        howTo?: string;
+        error?: string;
+      }
+      const results = await mapWithLimit<UploadSessionItem, UploadSessionResult>(payload.files, async ({ name, mimeType, sizeBytes, parentId, fileId }) => {
+        const label = name ?? fileId ?? null;
+        try {
+          if (!name && !fileId) {
+            return { name: label, fileId: fileId ?? null, error: "Provide `name` (new file) or `fileId` (replace)." };
           }
-        }),
-      );
-      return ok({
-        summary:
-          `⬆️ Created ${files.length} resumable upload session(s). ` +
-          "Client must PUT the raw file bytes to uploadUrl (see `howTo` per file), " +
-          "then call drive_confirm_upload.",
+          if (fileId && parentId) {
+            return {
+              name: label,
+              fileId: fileId ?? null,
+              error: "parentId cannot be combined with fileId — use drive_move to reparent.",
+            };
+          }
+          const resolvedMime = mimeType ?? DEFAULT_UPLOAD_MIME;
+          const url =
+            `${UPLOAD_ENDPOINT}${fileId ? `/${encodeURIComponent(fileId)}` : ""}` +
+            `?uploadType=resumable&supportsAllDrives=true` +
+            `&fields=${encodeURIComponent(UPLOAD_FIELDS)}`;
+          const metadata: Record<string, unknown> = {};
+          if (name) metadata.name = name;
+          if (!fileId && parentId) metadata.parents = [parentId];
+
+          const res = await fetch(url, {
+            method: fileId ? "PATCH" : "POST",
+            headers: {
+              Authorization: `Bearer ${token}`,
+              "Content-Type": "application/json; charset=UTF-8",
+              "X-Upload-Content-Type": resolvedMime,
+              ...(sizeBytes ? { "X-Upload-Content-Length": String(sizeBytes) } : {}),
+            },
+            body: JSON.stringify(metadata),
+          });
+          if (!res.ok) {
+            return { name: label, fileId: fileId ?? null, error: `Google returned ${res.status}: ${await errorBody(res)}` };
+          }
+          const uploadUrl = res.headers.get("location");
+          if (!uploadUrl) {
+            return {
+              name: label,
+              fileId: fileId ?? null,
+              error: "Google did not return a resumable session URI (no Location header).",
+            };
+          }
+          const total = sizeBytes ? String(sizeBytes) : "*";
+          const lastByte = sizeBytes ? String(sizeBytes - 1) : "<end>";
+          const howTo =
+            `PUT the raw bytes to uploadUrl with headers "Content-Type: ${resolvedMime}" and ` +
+            `"Content-Range: bytes 0-${lastByte}/${total}"` +
+            (sizeBytes
+              ? " (a single PUT of the whole file is fine). "
+              : " — the total size is unknown, so keep sending '*' as the total and put the " +
+                "real total in the Content-Range of the FINAL chunk to finalise the upload. ") +
+            "Then call drive_confirm_upload with the same uploadUrl.";
+          return {
+            name: name ?? null,
+            fileId: fileId ?? null,
+            mode: fileId ? ("replace" as const) : ("create" as const),
+            uploadUrl,
+            mimeType: resolvedMime,
+            sizeBytes: sizeBytes ?? null,
+            expiresAt,
+            howTo,
+          };
+        } catch (e: unknown) {
+          return { name: label, fileId: fileId ?? null, error: e instanceof Error ? e.message : String(e) };
+        }
+      });
+      // Honest limit (STANDARD §15.1 Q20, same convention as sheets-mcp's
+      // raw_batch_update): the actual bytes travel via a LATER, out-of-band
+      // client→Google PUT this server never sees, so nothing here can
+      // confirm content landed — that is what drive_confirm_upload is for.
+      // This only confirms the session-creation call itself succeeded.
+      return buildMutationResult({
         results,
+        total: payload.files.length,
+        verb: "Created session(s) for",
+        summaryIcon: "⬆️",
+        verify: async (r) =>
+          r.uploadUrl
+            ? {
+                outcome: "warn",
+                line: `- ⚠️ **«${safeText(r.name ?? r.fileId ?? "", 60)}»** — сессия создана; фактическая загрузка байт идёт напрямую клиент→Google и не проверяется этим вызовом, используйте drive_confirm_upload`,
+              }
+            : { outcome: "warn", line: `- ⚠️ **«${safeText(r.name ?? r.fileId ?? "", 60)}»** — сессия не создана` },
+        reportTitle: "Независимая проверка создания сессии загрузки",
+        reportSubtitle: "честный предел: содержимое проверяется отдельно через drive_confirm_upload",
+        consentStore,
+        auditId,
       });
     }),
   );
 
   // ── Resumable upload: confirm / check status ──────────────────────────────
+  // NOT gated — deliberate. This tool does not mutate anything: it's a status
+  // QUERY (a zero-length PUT with "bytes */<total>", i.e. Content-Range as a
+  // range probe) against a session Google already finalised (or not) the
+  // moment the CLIENT's own direct PUT of bytes to Google completed — an
+  // event this server was never a party to. Calling drive_confirm_upload
+  // zero, one, or many times changes nothing server-side; it only reads back
+  // what already happened. The actual write is gated at session-creation
+  // time (drive_create_upload_session above), which is the last point this
+  // server is in control before bytes start moving client→Google directly.
 
   server.registerTool(
     "drive_confirm_upload",
@@ -657,6 +1592,40 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
   );
 
   // ── Overwrite ──────────────────────────────────────────────────────────────
+  // REAL binding: re-reads each target's LIVE {name, mimeType, md5Checksum,
+  // modifiedTime} at plan and again at rehash — a concurrent edit between
+  // plan and execute changes the snapshot and trips the drift check.
+  // Pre-snapshot (identity-postverify.md §5.2): the plan-time read of
+  // md5Checksum/modifiedTime IS the "before" state, captured explicitly and
+  // attached to the audit row (this is what makes the loss of the old
+  // content honestly recorded, even though Drive itself keeps no old-content
+  // backup here).
+
+  interface OverwriteItem {
+    fileId: string;
+    mimeType?: string;
+    content_text?: string;
+    content_base64?: string;
+  }
+  interface OverwritePayload {
+    account: string;
+    files: OverwriteItem[];
+  }
+
+  async function overwriteBindingSnapshot(g: GoogleClients, files: OverwriteItem[]) {
+    return mapWithLimit(files, async (f) => {
+      const meta = await liveFileMeta(g, f.fileId);
+      return {
+        fileId: f.fileId,
+        mimeType: f.mimeType,
+        name: meta?.name ?? null,
+        liveMimeType: meta?.mimeType ?? null,
+        md5Checksum: meta?.md5Checksum ?? null,
+        modifiedTime: meta?.modifiedTime ?? null,
+        size: meta?.size ?? null,
+      };
+    });
+  }
 
   server.registerTool(
     "drive_overwrite_file",
@@ -665,7 +1634,11 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
       description:
         "Replace the content of one or more existing Drive files by their ids. " +
         "This is destructive — the previous content is lost (unless versioned first). " +
-        "Pass either `content_text` (UTF-8) or `content_base64` (binary) per file.",
+        "Pass either `content_text` (UTF-8) or `content_base64` (binary) per file. Two-mode consent-gated " +
+        "tool (mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with " +
+        "`files`) to build a plan and return a preview — NOTHING is overwritten yet. Show the preview to the " +
+        "user verbatim and wait for their reply. Call again with the returned `manifest_id` and the user's " +
+        "VERBATIM `user_reply` to actually overwrite.",
       inputSchema: {
         account,
         files: z
@@ -677,38 +1650,104 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
               content_base64: z.string().optional(),
             }),
           )
-          .min(1)
-          .describe("Array of files to overwrite."),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
       annotations: { destructiveHint: true },
     },
-    guard(async ({ account, files }) => {
+    guard(async ({ account, files, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = ctx;
+      if (!consentStore) {
+        return fail(
+          "Перезапись недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        files.map(async ({ fileId, mimeType, content_text, content_base64 }) => {
-          try {
-            if (!content_text && !content_base64) {
-              return { fileId, error: "Provide either content_text or content_base64." };
-            }
-            const buffer = content_base64
-              ? Buffer.from(content_base64, "base64")
-              : Buffer.from(content_text ?? "", "utf8");
-            const mediaMimeType = mimeType ?? "application/octet-stream";
-            const res = await g.drive.files.update({
-              fileId,
-              requestBody: {},
-              media: { mimeType: mediaMimeType, body: Readable.from(buffer) },
-              fields: "id,name",
-            });
-            return { fileId, name: res.data.name ?? null };
-          } catch (e: unknown) {
-            return { fileId, error: e instanceof Error ? e.message : String(e) };
+      const accountName = account ?? clients.defaultName;
+
+      const decision = await requireConsent<OverwritePayload>({
+        tool: "drive_overwrite_file",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: async () => {
+          if (!files || !files.length) {
+            throw new Error("Нужен непустой `files`, чтобы построить план перезаписи.");
           }
-        }),
-      );
-      return ok({
-        summary: `♻️ Overwrote ${files.length} file(s)`,
+          const snapshot = await overwriteBindingSnapshot(g, files);
+          const payload: OverwritePayload = { account: accountName, files };
+          const lines = snapshot.map((s) => {
+            const bytes = files.find((f) => f.fileId === s.fileId)?.content_base64
+              ? Math.ceil((files.find((f) => f.fileId === s.fileId)!.content_base64!.length * 3) / 4)
+              : Buffer.byteLength(files.find((f) => f.fileId === s.fileId)?.content_text ?? "", "utf8");
+            return `- **«${safeText(s.name ?? s.fileId, 60)}»** (сейчас ${s.size ?? "?"} байт, ${safeText(s.liveMimeType ?? "", 40)}) — заменится на ~${bytes} байт`;
+          });
+          const preview = `### 📤 План: Перезапись — ${files.length}\n\n${lines.join("\n")}`;
+          const objectHash = sha256({ account: accountName, files: snapshot });
+          return { payload, objectHash, preview, batchSize: files.length };
+        },
+        rehash: async (addressing) => {
+          const a = addressing as OverwritePayload;
+          const snapshot = await overwriteBindingSnapshot(g, a.files);
+          return sha256({ account: a.account, files: snapshot });
+        },
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      const preSnapshot = await overwriteBindingSnapshot(g, payload.files);
+      interface OverwriteResult {
+        fileId: string;
+        name: string | null;
+        error?: string;
+      }
+      const results = await mapWithLimit<OverwriteItem, OverwriteResult>(payload.files, async ({ fileId, mimeType, content_text, content_base64 }) => {
+        try {
+          if (!content_text && !content_base64) {
+            return { fileId, name: null, error: "Provide either content_text or content_base64." };
+          }
+          const buffer = content_base64
+            ? Buffer.from(content_base64, "base64")
+            : Buffer.from(content_text ?? "", "utf8");
+          const mediaMimeType = mimeType ?? "application/octet-stream";
+          const res = await g.drive.files.update({
+            fileId,
+            requestBody: {},
+            media: { mimeType: mediaMimeType, body: Readable.from(buffer) },
+            fields: "id,name",
+          });
+          return { fileId, name: res.data.name ?? null };
+        } catch (e: unknown) {
+          return { fileId, name: null, error: e instanceof Error ? e.message : String(e) };
+        }
+      });
+      return buildMutationResult({
         results,
+        total: payload.files.length,
+        verb: "Overwrote",
+        summaryIcon: "♻️",
+        verify: (r) => {
+          const before = preSnapshot.find((s) => s.fileId === r.fileId) ?? null;
+          return postVerifyOverwritten(g, r.fileId, before, r.name ?? r.fileId);
+        },
+        reportTitle: "Независимая проверка перезаписи",
+        reportSubtitle: "запрошено ⇄ живые метаданные Drive",
+        consentStore,
+        auditId,
+        preSnapshot,
       });
     }),
   );
@@ -904,6 +1943,14 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
   );
 
   // ── Extract text (OCR) ─────────────────────────────────────────────────────
+  // NOT gated — deliberate, and NOT in scope of the consent-gate port
+  // (mcp-development-standard/references/gate.md §3.1 covers write tools;
+  // this one is functionally a read). It DOES call files.copy + files.delete
+  // internally, but only against a server-named temporary file
+  // ("gmcp-ocr-tmp") that is created and destroyed within the same call and
+  // never left behind or exposed — there is no persisted, externally-visible
+  // mutation for a human to approve. Marked readOnlyHint so the gate-coverage
+  // reflective test classifies it correctly instead of demanding a gate.
 
   server.registerTool(
     "drive_extract_text",
@@ -920,7 +1967,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
           .optional()
           .describe("Optional language hint, e.g. 'en', 'ru'. Improves OCR accuracy."),
       },
-      annotations: { destructiveHint: false },
+      annotations: { readOnlyHint: true },
     },
     guard(async ({ account, fileIds, ocrLanguage }) => {
       const g = clients.resolve(account);
@@ -989,6 +2036,39 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
     }),
   );
 
+  // ── Share ──────────────────────────────────────────────────────────────────
+  // REAL binding: re-reads each target's LIVE {name, permissions} at plan and
+  // again at rehash — someone else changing access (or the file itself)
+  // between plan and execute trips the drift check. Necessarily-important
+  // per Maksim's decision (access to files!) — post-verify below RE-READS
+  // permissions.list, it does not just trust the create() response.
+
+  interface ShareItem {
+    fileId: string;
+    role: "reader" | "commenter" | "writer" | "fileOrganizer" | "organizer" | "owner";
+    type: "user" | "group" | "domain" | "anyone";
+    emailAddress?: string;
+    domain?: string;
+    sendNotificationEmail?: boolean;
+    emailMessage?: string;
+    transferOwnership?: boolean;
+  }
+  interface SharePayload {
+    account: string;
+    items: ShareItem[];
+  }
+
+  async function shareBindingSnapshot(g: GoogleClients, items: Array<{ fileId: string }>) {
+    return mapWithLimit(items, async (it) => {
+      const [meta, perms] = await Promise.all([liveFileMeta(g, it.fileId), livePermissions(g, it.fileId)]);
+      return {
+        fileId: it.fileId,
+        name: meta?.name ?? null,
+        permissions: perms ?? [],
+      };
+    });
+  }
+
   server.registerTool(
     "drive_share",
     {
@@ -996,7 +2076,11 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
       description:
         "Share one or more Drive files or folders with users, groups, domains, or make them public. " +
         "Use role='reader'|'commenter'|'writer'|'fileOrganizer'|'organizer'|'owner'. " +
-        "Set sendNotificationEmail=false to share silently.",
+        "Set sendNotificationEmail=false to share silently. Two-mode consent-gated tool " +
+        "(mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with `items`) " +
+        "to build a plan and return a preview — NOBODY is granted access yet. Show the preview to the user " +
+        "verbatim and wait for their reply. Call again with the returned `manifest_id` and the user's VERBATIM " +
+        "`user_reply` to actually share.",
       inputSchema: {
         account,
         items: z
@@ -1033,65 +2117,160 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
                 .describe("Transfer ownership (only for role=owner, same domain)."),
             }),
           )
-          .min(1)
-          .describe("Array of share operations."),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: true },
     },
-    guard(async ({ account, items }) => {
+    guard(async ({ account, items, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = ctx;
+      if (!consentStore) {
+        return fail(
+          "Открытие доступа недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
+            "может провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        items.map(
-          async ({
-            fileId,
-            role,
-            type,
-            emailAddress,
-            domain,
-            sendNotificationEmail,
-            emailMessage,
-            transferOwnership,
-          }) => {
-            try {
-              if ((type === "user" || type === "group") && !emailAddress) {
-                return { fileId, error: `emailAddress is required when type="${type}".` };
-              }
-              if (type === "domain" && !domain) {
-                return { fileId, error: `domain is required when type="domain".` };
-              }
-              const res = await g.drive.permissions.create({
-                fileId,
-                sendNotificationEmail: sendNotificationEmail ?? false,
-                emailMessage,
-                transferOwnership: transferOwnership ?? false,
-                requestBody: { role, type, emailAddress, domain },
-                fields: "id,role,type,emailAddress",
-              });
-              return {
-                fileId,
-                permissionId: res.data.id,
-                role: res.data.role,
-                type: res.data.type,
-                emailAddress: res.data.emailAddress,
-              };
-            } catch (e: unknown) {
-              return { fileId, error: e instanceof Error ? e.message : String(e) };
+      const accountName = account ?? clients.defaultName;
+
+      const decision = await requireConsent<SharePayload>({
+        tool: "drive_share",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: async () => {
+          if (!items || !items.length) {
+            throw new Error("Нужен непустой `items`, чтобы построить план открытия доступа.");
+          }
+          for (const it of items) {
+            if ((it.type === "user" || it.type === "group") && !it.emailAddress) {
+              throw new Error(`emailAddress is required when type="${it.type}".`);
             }
-          },
-        ),
+            if (it.type === "domain" && !it.domain) {
+              throw new Error(`domain is required when type="domain".`);
+            }
+          }
+          const snapshot = await shareBindingSnapshot(g, items);
+          const payload: SharePayload = { account: accountName, items };
+          const lines = items.map((it, i) => {
+            const who = it.emailAddress ?? it.domain ?? (it.type === "anyone" ? "кого угодно" : it.type);
+            const cur = snapshot[i];
+            return (
+              `- **«${safeText(cur.name ?? it.fileId, 60)}»** — выдать ${it.role} для ${safeText(who, 60)}` +
+              ` _(сейчас ${cur.permissions.length} право(а) доступа)_`
+            );
+          });
+          const preview = `### 📤 План: Открытие доступа — ${items.length}\n\n${lines.join("\n")}`;
+          const objectHash = sha256({ account: accountName, items, snapshot });
+          return { payload, objectHash, preview, batchSize: items.length };
+        },
+        rehash: async (addressing) => {
+          const a = addressing as SharePayload;
+          const snapshot = await shareBindingSnapshot(g, a.items);
+          return sha256({ account: a.account, items: a.items, snapshot });
+        },
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      interface ShareResult {
+        fileId: string;
+        role: string;
+        type: string;
+        emailAddress: string | null;
+        domain: string | null;
+        permissionId: string | null;
+        error?: string;
+      }
+      const results = await mapWithLimit<ShareItem, ShareResult>(
+        payload.items,
+        async ({ fileId, role, type, emailAddress, domain, sendNotificationEmail, emailMessage, transferOwnership }) => {
+          try {
+            const res = await g.drive.permissions.create({
+              fileId,
+              sendNotificationEmail: sendNotificationEmail ?? false,
+              emailMessage,
+              transferOwnership: transferOwnership ?? false,
+              requestBody: { role, type, emailAddress, domain },
+              fields: "id,role,type,emailAddress",
+            });
+            return {
+              fileId,
+              role,
+              type,
+              emailAddress: emailAddress ?? null,
+              domain: domain ?? null,
+              permissionId: res.data.id ?? null,
+            };
+          } catch (e: unknown) {
+            return {
+              fileId,
+              role,
+              type,
+              emailAddress: emailAddress ?? null,
+              domain: domain ?? null,
+              permissionId: null,
+              error: e instanceof Error ? e.message : String(e),
+            };
+          }
+        },
       );
-      return ok({
-        summary: `✅ Processed ${items.length} share operation(s)`,
+      return buildMutationResult({
         results,
+        total: payload.items.length,
+        verb: "Shared",
+        summaryIcon: "✅",
+        verify: (r) =>
+          postVerifyPermissionGranted(
+            g,
+            r.fileId,
+            { type: r.type, role: r.role, emailAddress: r.emailAddress ?? undefined, domain: r.domain ?? undefined },
+            r.fileId,
+          ),
+        reportTitle: "Независимая проверка открытия доступа",
+        reportSubtitle: "запрошено ⇄ живые permissions Drive",
+        consentStore,
+        auditId,
       });
     }),
   );
+
+  // ── Unshare ────────────────────────────────────────────────────────────────
+  // REAL binding: re-reads each target's LIVE permission list at plan and
+  // again at rehash — a concurrent revoke (or the file itself changing)
+  // between plan and execute trips the drift check.
+
+  interface UnshareItem {
+    fileId: string;
+    permissionId: string;
+  }
+  interface UnsharePayload {
+    account: string;
+    items: UnshareItem[];
+  }
 
   server.registerTool(
     "drive_unshare",
     {
       title: "Remove permissions",
       description:
-        "Remove sharing permissions from Drive files or folders. Use drive_get_permissions to find the permissionIds.",
+        "Remove sharing permissions from Drive files or folders. Use drive_get_permissions to find the " +
+        "permissionIds. Two-mode consent-gated tool (mcp-development-standard/references/gate.md): call " +
+        "WITHOUT `manifest_id`/`user_reply` (with `items`) to build a plan and return a preview — NOBODY loses " +
+        "access yet. Show the preview to the user verbatim and wait for their reply. Call again with the " +
+        "returned `manifest_id` and the user's VERBATIM `user_reply` to actually revoke.",
       inputSchema: {
         account,
         items: z
@@ -1101,26 +2280,191 @@ export function registerDriveTools(server: McpServer, clients: UserClients) {
               permissionId: z.string().describe("Permission ID to remove."),
             }),
           )
-          .min(1)
-          .describe("Array of {fileId, permissionId} pairs."),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
+      annotations: { destructiveHint: true },
     },
-    guard(async ({ account, items }) => {
+    guard(async ({ account, items, manifest_id, user_reply }) => {
+      const { consentStore, consentCfg } = ctx;
+      if (!consentStore) {
+        return fail(
+          "Отзыв доступа недоступен: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        items.map(async ({ fileId, permissionId }) => {
-          try {
-            await g.drive.permissions.delete({ fileId, permissionId });
-            return { fileId, permissionId };
-          } catch (e: unknown) {
-            return { fileId, permissionId, error: e instanceof Error ? e.message : String(e) };
+      const accountName = account ?? clients.defaultName;
+
+      const decision = await requireConsent<UnsharePayload>({
+        tool: "drive_unshare",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        plan: async () => {
+          if (!items || !items.length) {
+            throw new Error("Нужен непустой `items`, чтобы построить план отзыва доступа.");
           }
-        }),
-      );
-      return ok({
-        summary: `🔒 Removed ${items.length} permission(s)`,
+          const snapshot = await shareBindingSnapshot(g, items);
+          const payload: UnsharePayload = { account: accountName, items };
+          const lines = items.map((it, i) => {
+            const cur = snapshot[i];
+            const target = cur.permissions.find((p) => p.id === it.permissionId);
+            const who = target ? (target.emailAddress ?? target.domain ?? target.type ?? it.permissionId) : it.permissionId;
+            return `- **«${safeText(cur.name ?? it.fileId, 60)}»** — отозвать ${safeText(target?.role ?? "?", 20)} у ${safeText(who ?? "", 60)}`;
+          });
+          const preview = `### 📤 План: Отзыв доступа — ${items.length}\n\n${lines.join("\n")}`;
+          const objectHash = sha256({ account: accountName, items, snapshot });
+          return { payload, objectHash, preview, batchSize: items.length };
+        },
+        rehash: async (addressing) => {
+          const a = addressing as UnsharePayload;
+          const snapshot = await shareBindingSnapshot(g, a.items);
+          return sha256({ account: a.account, items: a.items, snapshot });
+        },
+      });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      interface UnshareResult {
+        fileId: string;
+        permissionId: string;
+        error?: string;
+      }
+      const results = await mapWithLimit<UnshareItem, UnshareResult>(payload.items, async ({ fileId, permissionId }) => {
+        try {
+          await g.drive.permissions.delete({ fileId, permissionId });
+          return { fileId, permissionId };
+        } catch (e: unknown) {
+          return { fileId, permissionId, error: e instanceof Error ? e.message : String(e) };
+        }
+      });
+      return buildMutationResult({
         results,
+        total: payload.items.length,
+        verb: "Removed",
+        summaryIcon: "🔒",
+        verify: (r) => postVerifyPermissionRemoved(g, r.fileId, r.permissionId, r.fileId),
+        reportTitle: "Независимая проверка отзыва доступа",
+        reportSubtitle: "запрошено ⇄ живые permissions Drive",
+        consentStore,
+        auditId,
       });
     }),
   );
+
+  // ── drive_consent_audit ──────────────────────────────────────────────────
+  // "Разбор инцидента без ssh" (limits-audit.md §11) — ported from gmail-mcp's
+  // gmail_consent_audit / sheets-mcp's sheets_consent_audit. Read-only path
+  // over the same consent_audit table the gate writes to; answers "what did
+  // the consent gate actually decide" and "did it block anything today"
+  // without reading server logs.
+
+  server.registerTool(
+    "drive_consent_audit",
+    {
+      title: "Read the consent-gate audit log",
+      description:
+        "Read-only log of every decision the consent gate has made for the gated drive_*/docs_*/" +
+        "skill_version_update write tools (drive_create_folder/rename/move/trash/upload_file/" +
+        "create_upload_session/overwrite_file/share/unshare, docs_create/append_text/insert_text/" +
+        "replace_text/raw_batch_update, skill_version_update): plan built, confirmed, refused, or invalidated, " +
+        "plus — once the mutation actually ran — its outcome and post-verify result. This is how to answer " +
+        "\"what actually happened to that file\" or \"did the gate block anything today\" without reading server " +
+        "logs. Filter by `since`/`until` (ISO 8601), `account`, `tool`, or `outcome` " +
+        "(confirmed/refused/invalidated/failed — a manifest that's only been planned and never answered has no " +
+        "audit row yet, nothing to show). Results are newest first, capped at 100 per page " +
+        "(default 20); use `offset` to page through older rows. External text (the verbatim user_reply and the " +
+        "outbound pre-snapshot) is shown neutralised, never as live markdown.",
+      inputSchema: {
+        account: z
+          .string()
+          .optional()
+          .describe("Filter to one account label. Omit to show all accounts, not just the default."),
+        since: z.string().optional().describe("ISO 8601 datetime — only rows at or after this time."),
+        until: z.string().optional().describe("ISO 8601 datetime — only rows at or before this time."),
+        tool: z
+          .string()
+          .optional()
+          .describe("Filter to one tool name, e.g. 'drive_share'. Omit to show every gated tool."),
+        outcome: z
+          .enum(["confirmed", "refused", "invalidated", "failed"])
+          .optional()
+          .describe("Filter to one outcome. Omit to show all."),
+        limit: z.number().int().min(1).max(100).default(20).optional().describe("Max rows to return (1-100, default 20)."),
+        offset: z.number().int().min(0).default(0).optional().describe("Skip this many newest-first rows — for paging past the first `limit`."),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    guard(async ({ account, since, until, tool, outcome, limit, offset }) => {
+      const { auditStore, consentCfg } = ctx;
+      if (!auditStore) {
+        return ok({
+          summary: "Audit log unavailable — DATABASE_URL is not configured, so nothing has been recorded.",
+          results: [],
+        });
+      }
+      const parseWhen = (label: string, s?: string): number | undefined => {
+        if (!s) return undefined;
+        const t = Date.parse(s);
+        if (Number.isNaN(t)) throw new Error(`Cannot parse ${label}="${s}". Use ISO 8601, e.g. 2026-08-04T00:00:00-07:00.`);
+        return t;
+      };
+      const filters = {
+        server: consentCfg.server,
+        since: parseWhen("since", since),
+        until: parseWhen("until", until),
+        accountLabel: account?.trim() || undefined,
+        tool: tool?.trim() || undefined,
+        outcome,
+      };
+      const cap = limit ?? 20;
+      const off = offset ?? 0;
+      const [rows, total] = await Promise.all([
+        auditStore.listConsentAudit(filters, cap, off),
+        auditStore.countConsentAudit(filters),
+      ]);
+
+      const outcomeIcon = (o: string): string =>
+        o === "confirmed" ? "✅" : o === "failed" ? "❌" : o === "refused" || o === "invalidated" ? "🛑" : "•";
+
+      const header = "| Время (PT) | Инструмент | Аккаунт | Actor | Исход | user_reply | post-verify | Детали |";
+      const sep = "|---|---|---|---|---|---|---|---|";
+      const lines = rows.map((r) => {
+        const details = r.error
+          ? `ошибка: ${safeText(r.error, 80)}`
+          : r.preSnapshot
+            ? `снимок: ${safeText(JSON.stringify(r.preSnapshot), 100)}`
+            : "—";
+        return (
+          `| ${formatLaTime(r.ts)} | ${r.tool} | ${r.accountLabel} | ${r.actor} | ` +
+          `${outcomeIcon(r.outcome)} ${r.outcome} | ${safeText(r.userReply, 60) || "—"} | ` +
+          `${safeText(r.postVerifyResult ?? "", 60) || "—"} | ${details} |`
+        );
+      });
+
+      const shownNote =
+        total > off + rows.length
+          ? `Показано ${rows.length} из ${total} (записи ${off + 1}–${off + rows.length}); ` +
+            `есть ещё — вызовите снова с offset=${off + rows.length}.`
+          : `Показано ${rows.length} из ${total}.`;
+
+      const body = rows.length ? [header, sep, ...lines].join("\n") : "Нет записей, подходящих под фильтры.";
+
+      return ok(`### 🧾 Журнал согласий\n\n${shownNote}\n\n${body}`);
+    }),
+  );
 }
+
