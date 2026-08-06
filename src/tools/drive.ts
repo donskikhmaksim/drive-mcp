@@ -24,8 +24,13 @@ import {
   type ConsentStore,
   type ConsentConfig,
   type ConsentAddressing,
+  // Тип берётся ИЗ consent.js, а не из tg_approval.js: gate, который реально
+  // передаётся в `requireConsent`, обязан уметь ещё и `hasAutoExecutor(tool)`
+  // (вторая половина правила «исполнение только кнопкой»). Если типизировать
+  // его версией из tg_approval.js, расхождение всплыло бы уже в проде —
+  // здесь оно падает на СБОРКЕ.
+  type TgApprovalGate,
 } from "../consent.js";
-import type { TgApprovalGate } from "../tg_approval.js";
 import { registerAutoExecutor, type AutoExecutorCtx } from "../autoExecute.js";
 
 // ── Consent-gate context (shared across drive.ts/docs.ts/skill_version.ts) ──

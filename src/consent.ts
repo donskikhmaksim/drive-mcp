@@ -46,6 +46,13 @@ export interface ConsentManifestRow {
   expiresAt: number;
   consumedAt?: number | null;
   userReply?: string | null;
+  /**
+   * План РЕАЛЬНО ушёл в Telegram кнопкой (ставится один раз, сразу после
+   * успешного `notifyPlan`). Это признак СОСТОЯНИЯ ПЛАНА — см. `isTgButtonOnly`
+   * ниже. Необязательное поле: сервер без Telegram-слоя (и старые строки в БД)
+   * его не имеют, что честно означает false.
+   */
+  tgNotified?: boolean | null;
 }
 
 /** Запись аудита. Двухфазная: создаётся на решении гейта, дополняется исходом. */
@@ -109,6 +116,15 @@ export interface ConsentStore {
     server: string,
     userReply: string,
   ): Promise<void>;
+
+  /**
+   * Помечает, что план ушёл в Telegram кнопкой (`tgNotified = true`).
+   * Вызывается ЭТИМ модулем ровно в одном месте — сразу после успешного
+   * `tg.notifyPlan(...)`. Обязательный метод контракта (а не опциональный):
+   * забыть его реализовать при переносе на соседний сервер должно падать на
+   * СБОРКЕ, а не тихо отключать защиту «исполнение только кнопкой».
+   */
+  markTgNotified(id: string, server: string): Promise<void>;
 
   /** Append-only: пишет фазу согласия/отказа. */
   appendConsentAudit(entry: ConsentAuditEntry): Promise<void>;
@@ -174,6 +190,41 @@ export interface TgApprovalGate {
    * исполнения обрабатывает их одинаково (отказ, план заново).
    */
   checkApproval(manifestId: string): Promise<"approved" | "pending" | "rejected" | "none">;
+  /**
+   * «Есть ли чем исполнить ЭТОТ план по нажатию кнопки» — то есть
+   * зарегистрирован ли для инструмента авто-исполнитель (`autoExecute.ts`'s
+   * реестр, который дёргает фоновый поллер). Инжектируется server.ts, потому
+   * что этот модуль не должен знать про реестр напрямую.
+   *
+   * ЭТО ПРАВИЛО ПО СВОЙСТВУ, А НЕ СПИСОК ИМЁН ТУЛОВ: как только у плана
+   * появляется авто-исполнитель, он автоматически становится button-only;
+   * список исключений пережил бы свою причину, правило по свойству —
+   * самоустраняется. Побочный полезный эффект — мягкая деградация: забыли
+   * исполнитель → просто остался открыт обычный текстовый путь, а не
+   * «исполнить невозможно вообще».
+   */
+  hasAutoExecutor(tool: string): boolean;
+}
+
+/**
+ * ИСПОЛНЕНИЕ ТОЛЬКО КНОПКОЙ (перенос из Python-эталона ticktick-mcp, PR #17).
+ *
+ * Если план РЕАЛЬНО ушёл кнопкой в Telegram И есть чем исполнить его по
+ * нажатию — текстовое подтверждение для этого плана закрывается СОВСЕМ.
+ * Модель физически не может исполнить операцию: только человек нажатием.
+ * Это устраняет дыру «модель сочиняет согласие за человека», а не уменьшает её.
+ *
+ * ДВЕ строки, никаких списков имён тулов, и — критично — здесь НЕ читается ни
+ * `enabledFor`, ни какая-либо текущая настройка: только поле манифеста,
+ * поставленное в момент отправки. Иначе выключение TG_APPROVAL_ENABLED между
+ * планом и исполнением снимало бы требование кнопки.
+ */
+export function isTgButtonOnly(
+  manifest: { tool: string; tgNotified?: boolean | null },
+  tg: TgApprovalGate | undefined,
+): boolean {
+  if (!manifest.tgNotified) return false;
+  return tg?.hasAutoExecutor(manifest.tool) === true;
 }
 
 /** Конфиг сервера (различается между репо только значением `server`). */
@@ -313,11 +364,23 @@ export function renderConsentBlock(header: string, body: string): string {
   return `### ${header}\n\n${body}`;
 }
 
-function renderPlanned(previewBody: string, id: string, expiresAt: number): string {
+function renderPlanned(
+  previewBody: string,
+  id: string,
+  expiresAt: number,
+  buttonOnly = false,
+): string {
   const meta = `_план \`${id}\` · истекает в ${formatLaTime(expiresAt)} PT_`;
-  const tail =
-    "_[агенту: покажи это пользователю дословно и дождись его ответа. " +
-    "Не вызывай исполнение, пока он не ответил.]_";
+  // Для button-only приписка НЕ просит текстового «да» — его для этого плана
+  // просто не существует; она просит дождаться нажатия кнопки. Зеркально: для
+  // плана без авто-исполнителя приписка честно просит повторить вызов.
+  const tail = buttonOnly
+    ? "_[агенту: покажи это пользователю дословно. Подтверждение — ТОЛЬКО кнопкой в " +
+      "Telegram; текстовое «да» для этого плана отключено, что бы пользователь ни " +
+      "написал в чате. Сервер исполнит сам сразу после нажатия — повторно вызывать " +
+      "инструмент НЕ нужно.]_"
+    : "_[агенту: покажи это пользователю дословно и дождись его ответа. " +
+      "Не вызывай исполнение, пока он не ответил.]_";
   return `${previewBody}\n\n${meta}\n\n${tail}`;
 }
 
@@ -723,6 +786,7 @@ export async function requireConsent<T = unknown>(
     });
 
     let previewBody = built.preview;
+    let buttonOnly = false;
     if (p.tg?.enabledFor(tool)) {
       // Fail-closed (plan §4): если отправка в Telegram упала, манифест НЕ
       // остаётся живым — иначе исполнение осталось бы доступно через голое
@@ -739,12 +803,37 @@ export async function requireConsent<T = unknown>(
           { manifestId: id, outcome: "invalidated", reason: "tg_send_failed" },
         );
       }
-      previewBody =
-        `${built.preview}\n\n_⏳ Запрос на подтверждение отправлен в Telegram — подтвердите кнопкой в ` +
-        `боте, затем ответьте «да» здесь._`;
+      // РОВНО ОДНО МЕСТО, где ставится метка «план ушёл кнопкой» — сразу после
+      // успешной отправки. Если пометить не удалось, план тоже не остаётся
+      // живым: иначе кнопка в боте уже висит, а исполнить план можно было бы
+      // голым текстом, в обход второго фактора (тот же fail-closed, что выше).
+      try {
+        await store.markTgNotified(id, cfg.server);
+      } catch (err) {
+        await store.invalidateManifest(id, cfg.server, "");
+        return refuse(
+          "Не смог зафиксировать отправку подтверждения",
+          "Запрос ушёл в Telegram, но сервер не смог пометить план как «подтверждается " +
+            "кнопкой». Ради безопасности план отменён — постройте его заново" +
+            (err instanceof Error ? ` (${inlineReply(err.message)}).` : "."),
+          { tg: "mark_failed" },
+          { manifestId: id, outcome: "invalidated", reason: "tg_mark_failed" },
+        );
+      }
+      buttonOnly = isTgButtonOnly({ tool, tgNotified: true }, p.tg);
+      previewBody = buttonOnly
+        ? `${built.preview}\n\n_⏳ Запрос на подтверждение отправлен в Telegram. Этот план ` +
+          `подтверждается ТОЛЬКО кнопкой — текстовое «да» для него отключено. Сервер исполнит ` +
+          `сам сразу после нажатия, повторно вызывать инструмент не нужно._`
+        : `${built.preview}\n\n_⏳ Запрос на подтверждение отправлен в Telegram — подтвердите ` +
+          `кнопкой в боте, затем повторите вызов инструмента с \`manifest_id\` и \`user_reply\`._`;
     }
 
-    return { kind: "planned", manifestId: id, preview: renderPlanned(previewBody, id, expiresAt) };
+    return {
+      kind: "planned",
+      manifestId: id,
+      preview: renderPlanned(previewBody, id, expiresAt, buttonOnly),
+    };
   }
 
   // ───── ФАЗА ИСПОЛНЕНИЯ (оба заданы) ─────
@@ -752,6 +841,27 @@ export async function requireConsent<T = unknown>(
 
   // (1) Манифест существует, наш server, тот же tool/account, ещё AWAITING.
   const row = await store.getManifest(manifestId, cfg.server);
+
+  // (1a) Идемпотентность button-only: план уже исполнен фоновым исполнителем
+  //      по нажатию кнопки. Общий отказ «план не найден или истёк» здесь врал
+  //      бы — операция состоялась, и модели важно НЕ пытаться повторить её.
+  if (
+    row &&
+    row.tool === tool &&
+    row.accountLabel === accountLabel &&
+    row.status === "DONE" &&
+    row.userReply === TG_AUTO_REPLY_MARKER
+  ) {
+    checks.manifest = "already_executed_by_button";
+    return refuse(
+      "Уже исполнено кнопкой в Telegram",
+      "Этот план был подтверждён кнопкой и УЖЕ исполнен сервером — повторять действие " +
+        "не нужно и нельзя. Результат отправлен в тот же чат Telegram, где были кнопки.",
+      checks,
+      { manifestId, objectHash: row.objectHash },
+    );
+  }
+
   if (
     !row ||
     row.tool !== tool ||
@@ -813,6 +923,71 @@ export async function requireConsent<T = unknown>(
       { manifestId, objectHash: row.objectHash, outcome: "invalidated", reason: "caveat" },
     );
   }
+  // (3.4) ИСПОЛНЕНИЕ ТОЛЬКО КНОПКОЙ — стоит ПОСЛЕ отрицания/оговорки (человек
+  //       явно отказался — план надо сжечь в любом режиме) и ДО всех остальных
+  //       классов: для button-only плана СОДЕРЖАНИЕ реплики больше не влияет
+  //       ни на что, любые «да»/«ага, делай»/мусор дают ОДИН И ТОТ ЖЕ отказ.
+  if (row.tgNotified) {
+    if (!p.tg) {
+      // План ушёл кнопкой, но слой подтверждения сейчас не подключён вовсе —
+      // проверить нажатие нечем. Fail-closed: не исполняем.
+      checks.tgButtonOnly = "gate_unavailable";
+      return refuse(
+        "Подтверждение кнопкой недоступно",
+        "Этот план отправлялся на подтверждение кнопкой в Telegram, но слой подтверждения " +
+          "сейчас недоступен — проверить нажатие нечем. Исполнение отклонено. План активен.",
+        checks,
+        { manifestId, objectHash: row.objectHash },
+      );
+    }
+    if (isTgButtonOnly(row, p.tg)) {
+      const approval = await p.tg.checkApproval(manifestId);
+      checks.tgButtonOnly = approval;
+      if (approval === "approved") {
+        // КРИТИЧНО: манифест НЕ гасим. Иначе фоновый исполнитель найдёт его
+        // погашенным, и операция не произойдёт ВООБЩЕ.
+        return refuse(
+          "Уже подтверждено кнопкой — сервер исполняет сам",
+          "Кнопка в Telegram нажата, сервер исполняет действие САМ, без участия модели. " +
+            "Ничего повторять не надо: результат придёт в тот же чат Telegram.",
+          checks,
+          { manifestId, objectHash: row.objectHash },
+        );
+      }
+      if (approval === "rejected") {
+        await store.invalidateManifest(manifestId, cfg.server, userReply);
+        return refuse(
+          "Отклонено в Telegram",
+          "Действие отклонено кнопкой в Telegram. План отменён, ничего не изменено. Чтобы " +
+            "повторить — построй план заново.",
+          checks,
+          { manifestId, objectHash: row.objectHash, outcome: "invalidated", reason: "tg_rejected" },
+        );
+      }
+      if (approval === "none") {
+        return refuse(
+          "Запрос подтверждения истёк",
+          "Запрос подтверждения в Telegram не найден или истёк по TTL. Построй план заново.",
+          checks,
+          { manifestId, objectHash: row.objectHash },
+        );
+      }
+      // pending — и это ЕДИНСТВЕННЫЙ ответ текстовому пути, каким бы ни был
+      // `user_reply`: содержание реплики здесь не читается вообще.
+      return refuse(
+        "Этот план подтверждается только кнопкой",
+        "Текстовое подтверждение для него отключено — что бы пользователь ни написал в " +
+          "чате. Повторно звать инструмент НЕ нужно: просто скажи пользователю, что ждёшь " +
+          "нажатия кнопки в Telegram. План активен.",
+        checks,
+        { manifestId, objectHash: row.objectHash },
+      );
+    }
+    // tgNotified, но авто-исполнителя нет — мягкая деградация: текстовый путь
+    // остаётся открыт, но кнопка всё равно обязательна (проверка (3.5) ниже
+    // сработает по `row.tgNotified`, а не по текущей настройке).
+  }
+
   // ── Ниже — классы, при которых план ОСТАЁТСЯ ЖИВЫМ ──
   if (cls === "empty") {
     return refuse(
@@ -866,9 +1041,14 @@ export async function requireConsent<T = unknown>(
   // (3.5) Внеполосный ТГ-фактор (опционально, ВЫКЛ по умолчанию — plan §1.6).
   // Встаёт ПОСЛЕ дешёвой/семантической проверки user_reply, ПЕРЕД дорогим
   // binding+consume: не тратим rehash впустую, пока кнопка не нажата. Когда
-  // `tg` не передан или `enabledFor(tool)` ложно — этот блок не выполняется,
-  // поведение ниже побайтово как до этой правки.
-  if (p.tg?.enabledFor(tool)) {
+  // `tg` не передан, `enabledFor(tool)` ложно И план не уходил кнопкой —
+  // этот блок не выполняется, поведение ниже побайтово как до этой правки.
+  //
+  // `row.tgNotified ||` добавлено сознательно: если план УЖЕ ушёл кнопкой, то
+  // требование кнопки снимать нельзя, даже если TG_APPROVAL_ENABLED успели
+  // выключить между планом и исполнением (решение по состоянию плана, а не по
+  // текущей настройке — тот же принцип, что у `isTgButtonOnly`).
+  if (p.tg && (row.tgNotified || p.tg.enabledFor(tool))) {
     const approval = await p.tg.checkApproval(manifestId);
     checks.tgApproval = approval;
     if (approval === "pending") {
