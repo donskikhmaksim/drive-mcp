@@ -36,6 +36,11 @@ import { registerDriveTools } from "../dist/tools/drive.js";
 import { registerDocsTools } from "../dist/tools/docs.js";
 import { registerSkillVersionTools } from "../dist/tools/skill_version.js";
 import { registerAccountTools } from "../dist/accounts.js";
+import { initDownloads } from "../dist/downloads.js";
+
+// drive_get_download_url refuses outright when the server does not know its
+// own public URL, which would short-circuit the gate check below — give it one.
+initDownloads("https://drive.example.test");
 
 let failures = 0;
 const check = (label, cond, extra = "") => {
@@ -85,6 +90,15 @@ const GATED_TOOLS = {
   drive_overwrite_file: {
     args: { files: [{ fileId: "F1", content_text: "new content" }] },
     counterKey: "filesUpdate",
+    destructive: true,
+  },
+  drive_get_download_url: {
+    args: { files: [{ fileId: "F1" }] },
+    // Issuing a link touches no Google API — the capability is minted by
+    // src/downloads.ts — so the "nothing happened yet" proof is that the plan
+    // response contains no link at all.
+    counterKey: null,
+    forbiddenInPlan: "/dl/",
     destructive: true,
   },
   drive_share: {
@@ -293,16 +307,21 @@ for (const [name, spec] of Object.entries(GATED_TOOLS)) {
 
 console.log("\n[4] behavioural proof: calling each gated tool WITHOUT manifest_id/user_reply never mutates");
 for (const [name, spec] of Object.entries(GATED_TOOLS)) {
-  const before = counters[spec.counterKey];
+  const before = spec.counterKey ? counters[spec.counterKey] : null;
   const resp = await cli.callTool({ name, arguments: spec.args });
   const body = text(resp);
-  check(`${name} plan call: mutation counter (${spec.counterKey}) unchanged`, counters[spec.counterKey] === before, String(counters[spec.counterKey]));
+  if (spec.counterKey) {
+    check(`${name} plan call: mutation counter (${spec.counterKey}) unchanged`, counters[spec.counterKey] === before, String(counters[spec.counterKey]));
+  }
+  if (spec.forbiddenInPlan) {
+    check(`${name} plan call: no «${spec.forbiddenInPlan}» handed out before consent`, !body.includes(spec.forbiddenInPlan), body.slice(0, 120));
+  }
   check(`${name} plan call: response is a plan, not a success/failure header`, body.includes("### 📤 План"), body.slice(0, 60));
   check(`${name} plan call: no ✅/✏️/📁/❌ success-style header`, !/^[✅✏️📁❌♻️]/.test(body), body.slice(0, 10));
 }
 
 console.log("\n[5] read tools genuinely carry readOnlyHint (spot-check, not exhaustive)");
-for (const name of ["drive_search", "drive_get_metadata", "drive_download_file", "drive_get_download_url", "drive_get_permissions", "drive_extract_text", "drive_confirm_upload", "drive_consent_audit", "docs_list", "docs_read", "list_accounts"]) {
+for (const name of ["drive_search", "drive_get_metadata", "drive_download_file", "drive_get_permissions", "drive_extract_text", "drive_confirm_upload", "drive_consent_audit", "docs_list", "docs_read", "list_accounts"]) {
   const t = tools.find((x) => x.name === name);
   check(`${name} readOnlyHint: true`, t?.annotations?.readOnlyHint === true, JSON.stringify(t?.annotations));
 }
