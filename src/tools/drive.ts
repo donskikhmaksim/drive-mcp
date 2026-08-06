@@ -107,6 +107,11 @@ export interface DriveConsentContext {
    * `requireConsent({ ... })` call in this file below destructures `tg` from
    * `ctx` and passes it through (`tg,` shorthand). Setting
    * TG_APPROVAL_ENABLED=true does have runtime effect here.
+   *
+   * Since 2026-08-06 the gate must ALSO answer `hasAutoExecutor(tool)` — hence
+   * the type comes from `../consent.js`, not from `../tg_approval.js`: a plan
+   * that went out as a button AND has an auto-executor is executed ONLY by the
+   * button (see `isTgButtonOnly`), and the text path is closed for it.
    */
   tg?: TgApprovalGate;
 }
