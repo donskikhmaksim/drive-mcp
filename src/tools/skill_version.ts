@@ -8,13 +8,30 @@
  *       versions/
  *         [skill_name]_vX.Y_YYYY-MM-DD.md ← archived
  *
- * SKILLS_ROOT_FOLDER_ID is hardcoded — this tool cannot touch anything outside
- * that folder, making it safe for always_allow.
+ * ГРАНИЦА «только внутри Skills/» (почему инструмент считается узким).
+ * Захардкоженный `SKILLS_ROOT_FOLDER_ID` сам по себе границей НЕ является: до
+ * фикса 2026-08-06 `skill_name` подставлялся в Drive-query без экранирования, и
+ * значение с одинарной кавычкой дописывало вторую дизъюнкцию БЕЗ условия
+ * `'<SKILLS_ROOT_FOLDER_ID>' in parents` — то есть уводило инструмент в любую
+ * папку аккаунта (там он создаёт `versions/`, ПЕРЕМЕЩАЕТ туда найденный файл и
+ * создаёт новый файл с содержимым, которое полностью контролирует модель).
+ *
+ * Теперь границу держат три независимых слоя, а не один:
+ *   1. формат — `skill_name` проходит `SKILL_NAME_RE` (кавычка и обратный слэш
+ *      физически невозможны), отказ до любого обращения к Drive;
+ *   2. экранирование — всё, что подставляется в `q:`, идёт через
+ *      `escapeDriveQueryValue()` (`\` перед `'`, а не только `'`);
+ *   3. пост-проверка принадлежности — у найденной папки перечитываются
+ *      `parents` и сверяются с `SKILLS_ROOT_FOLDER_ID`, а у архивируемого файла
+ *      — со свежим `files.get` ПЕРЕД мутацией. Даже если строка запроса когда-
+ *      нибудь снова окажется испорченной, мутация не выполнится.
+ * Именно слой 3 (а не «id захардкожен») — то, чем обосновывается always_allow и
+ * авто-исполнение по кнопке в Telegram.
  */
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { ok, fail, guard, safeText } from "../util.js";
+import { ok, fail, guard, safeText, escapeDriveQueryValue } from "../util.js";
 import { buildUserClients, type UserClients } from "../accounts.js";
 import { loadConfig } from "../config.js";
 import {
@@ -33,6 +50,24 @@ import { registerAutoExecutor, type AutoExecutorCtx } from "../autoExecute.js";
 const SKILLS_ROOT_FOLDER_ID = "1kjYll-ULT_Z1CFG80HcwgJR6AaS6CVg9";
 const VERSIONS_FOLDER_NAME = "versions";
 const ACCOUNT = "personal";
+
+/**
+ * Допустимый формат имени навыка = имени его папки в Skills/ и префикса имени
+ * файла (`<skill_name>_vX.Y_YYYY-MM-DD.md`). Набор символов подобран по
+ * реальным навыкам Максима (`email_management`, `mcp-development-standard`,
+ * `ticktick-daily-review`): латиница, цифры, `_`, `-`. Кавычка, обратный слэш,
+ * пробел и всё остальное запрещены — это первый слой защиты от инъекции в
+ * Drive-query (`references/security-checklist.md` §2: идентификаторы из
+ * аргументов валидируются по формату).
+ */
+const SKILL_NAME_RE = /^[A-Za-z0-9_-]{1,100}$/;
+
+/** Лежит ли объект Drive непосредственно внутри папки `parentId`. Отсутствие
+ * поля `parents` в ответе трактуется как «не лежит» (fail-closed): пустой ответ
+ * НИКОГДА не должен читаться как разрешение. */
+function isChildOf(file: { parents?: string[] | null } | null | undefined, parentId: string): boolean {
+  return !!file && Array.isArray(file.parents) && file.parents.includes(parentId);
+}
 
 /** Compare semver-ish strings like "3.2" < "3.3" < "10.0". */
 function versionGt(a: string, b: string): boolean {
@@ -70,23 +105,53 @@ async function resolveSkillState(
   | { ok: true; skillFolderId: string; currentFile: { id: string; name: string; version: string } | null }
   | { ok: false; error: string }
 > {
+  // ── Слой 1: формат имени. Отказ ДО любого обращения к Drive ───────────────
+  if (!SKILL_NAME_RE.test(skill_name)) {
+    return {
+      ok: false,
+      error:
+        `Недопустимое имя навыка «${safeText(skill_name, 60)}». Разрешены только латинские буквы, ` +
+        `цифры, дефис и подчёркивание (1–100 символов); кавычки, обратные слэши и пробелы запрещены — ` +
+        `имя подставляется в поисковый запрос Google Drive. Ничего не искал и не менял.`,
+    };
+  }
+
+  // ── Слой 2: экранирование при подстановке в запрос ────────────────────────
   const skillFolderRes = await g.drive.files.list({
-    q: `name='${skill_name}' and '${SKILLS_ROOT_FOLDER_ID}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-    fields: "files(id,name)",
+    q: `name='${escapeDriveQueryValue(skill_name)}' and '${escapeDriveQueryValue(SKILLS_ROOT_FOLDER_ID)}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+    fields: "files(id,name,parents)",
     pageSize: 5,
   });
-  const skillFolder = skillFolderRes.data.files?.[0];
+  const candidates = skillFolderRes.data.files ?? [];
+
+  // ── Слой 3: пост-проверка принадлежности. Не доверяем тому, что фильтр в
+  // строке запроса отработал: у КАЖДОГО кандидата сверяем имя и `parents` с
+  // тем, что просили. Защита перестаёт зависеть от корректности строки. ──────
+  const skillFolder = candidates.find(
+    (f) => f.id && f.name === skill_name && isChildOf(f, SKILLS_ROOT_FOLDER_ID),
+  );
   if (!skillFolder?.id) {
+    if (candidates.length > 0) {
+      return {
+        ok: false,
+        error:
+          `Отказ: поиск папки навыка «${safeText(skill_name, 60)}» вернул объект, который НЕ лежит ` +
+          `непосредственно внутри папки Skills (или называется иначе). Инструменту разрешено работать ` +
+          `только внутри Skills/ — ничего не создано, не перемещено и не изменено.`,
+      };
+    }
     return { ok: false, error: `Skill folder "${skill_name}" not found inside Skills/. Create it first.` };
   }
   const skillFolderId = skillFolder.id;
 
   const topFilesRes = await g.drive.files.list({
-    q: `'${skillFolderId}' in parents and name contains '.md' and mimeType='text/plain' and trashed=false`,
-    fields: "files(id,name)",
+    q: `'${escapeDriveQueryValue(skillFolderId)}' in parents and name contains '.md' and mimeType='text/plain' and trashed=false`,
+    fields: "files(id,name,parents)",
     pageSize: 20,
   });
-  const topFiles = topFilesRes.data.files ?? [];
+  // Та же пост-проверка для файлов-кандидатов на архивацию: в рассмотрение
+  // попадают только те, кто реально лежит в папке навыка.
+  const topFiles = (topFilesRes.data.files ?? []).filter((f) => isChildOf(f, skillFolderId));
 
   let currentFile: { id: string; name: string; version: string } | null = null;
   for (const f of topFiles) {
@@ -167,16 +232,43 @@ async function executeSkillVersionCore(
   }
   const { skillFolderId, currentFile } = state;
 
+  // ── Identity-guard архивируемого файла — ДО любой мутации ─────────────
+  // (mcp-development-standard §4): свежим запросом перечитываем сам файл и
+  // убеждаемся, что он всё ещё называется так же и лежит внутри папки навыка
+  // (которая уже доказана как подпапка Skills/). Перемещение чужого файла —
+  // ровно то, что давала инъекция в поисковый запрос, поэтому проверка стоит
+  // ДО создания `versions/`: отказ не должен оставлять за собой даже пустую
+  // папку.
+  if (currentFile) {
+    const live = await g.drive.files
+      .get({ fileId: currentFile.id, fields: "id,name,parents,trashed" })
+      .then((res) => res.data)
+      .catch(() => null);
+    if (!live || live.name !== currentFile.name || live.trashed === true || !isChildOf(live, skillFolderId)) {
+      const err =
+        `Отказ: архивируемый файл «${safeText(currentFile.name, 80)}» при перепроверке не найден в папке ` +
+        `навыка «${safeText(payload.skill_name, 60)}» (переименован, удалён или лежит в другой папке). ` +
+        `Ничего не перемещено и не создано — построй план заново.`;
+      await consentStore.updateConsentAuditOutcome(auditId, { outcome: "failed", error: err }).catch(() => {});
+      return fail(err);
+    }
+  }
+
   // ── Find or create versions/ subfolder ──────────────────────────────
   let versionsFolderId: string;
   try {
     const vfRes = await g.drive.files.list({
-      q: `name='${VERSIONS_FOLDER_NAME}' and '${skillFolderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-      fields: "files(id)",
+      q: `name='${escapeDriveQueryValue(VERSIONS_FOLDER_NAME)}' and '${escapeDriveQueryValue(skillFolderId)}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+      fields: "files(id,name,parents)",
       pageSize: 2,
     });
-    if (vfRes.data.files?.[0]?.id) {
-      versionsFolderId = vfRes.data.files[0].id;
+    // Та же пост-проверка: принимаем только реальную подпапку `versions/`
+    // ИМЕННО этой папки навыка — иначе файл уехал бы в чужую папку.
+    const existingVersions = (vfRes.data.files ?? []).find(
+      (f) => f.id && f.name === VERSIONS_FOLDER_NAME && isChildOf(f, skillFolderId),
+    );
+    if (existingVersions?.id) {
+      versionsFolderId = existingVersions.id;
     } else {
       const created = await g.drive.files.create({
         requestBody: {
@@ -245,6 +337,14 @@ async function executeSkillVersionCore(
         .catch(() => null);
       const lbl = safeText(r.newFileName) || "(файл)";
       if (!meta) return { outcome: "warn", line: `- ⚠️ **«${lbl}»** — не удалось перепроверить новый файл` };
+      // Пруф включает и принадлежность: «файл существует» без «и лежит там,
+      // где обещали» — не доказательство границы Skills/.
+      if (!isChildOf(meta, r.skillFolderId)) {
+        return {
+          outcome: "mismatch",
+          line: `- ❌ **«${safeText(meta.name ?? lbl)}»** — новый файл лежит НЕ в папке навыка ${safeText(payload.skill_name)}`,
+        };
+      }
       return { outcome: "ok", line: `- ✅ **«${safeText(meta.name ?? lbl)}»** — новый файл существует в Skills/${safeText(payload.skill_name)}` };
     },
     reportTitle: "Независимая проверка обновления навыка",
