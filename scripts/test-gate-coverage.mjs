@@ -17,15 +17,21 @@
  *    `UNGATED_WRITE_ALLOWLIST` below, with a one-line reason.
  *
  * Per Maksim's standing decision (2026-08-04, "гейт у ВСЕХ write, без
- * исключений") this repo's allowlist has exactly ONE entry: drive_extract_text
- * — it is functionally a read (OCR text extraction) whose internal
- * files.copy+files.delete targets only an ephemeral, server-named temp file
- * that is created and destroyed within the same call, never left behind or
- * exposed to the user; nothing persisted needs a human's consent. It carries
- * readOnlyHint:true in the registry (see src/tools/drive.ts), so in practice
- * it is classified as a READ below and this allowlist entry never fires —
- * kept only so a future accidental removal of that annotation fails loudly
- * here instead of shipping silently ungated.
+ * исключений") the allowlist stays tiny and every entry carries a reason.
+ *
+ * ⚠️ WHAT THIS FILE STILL CANNOT DO (2026-08-06). Classification here is the
+ * tool's OWN `readOnlyHint`, i.e. a hand-written label. That is precisely how
+ * drive_extract_text hid for months: it declared readOnlyHint:true while
+ * copying a file and permanently deleting the copy, so it was counted as a
+ * READ and its allowlist entry below could never fire. The label has now been
+ * removed from the two tools that were lying (drive_extract_text,
+ * drive_confirm_upload) and both are named in the allowlist for real — but the
+ * NEXT such tool would hide just as easily. gmail-mcp already replaced this
+ * rule with a static scan of the sources for side-effect markers
+ * (`scripts/test-gate-coverage.mjs` there); porting that scan here — with
+ * Drive-shaped markers (files.create/update/delete/copy, permissions.*,
+ * documents.batchUpdate, raw fetch, issueDownloadLink) — is the actual fix and
+ * is tracked separately.
  *
  * Usage: node scripts/test-gate-coverage.mjs
  */
@@ -47,7 +53,16 @@ const check = (label, cond, extra = "") => {
 const text = (r) => r.content[0].text;
 
 const UNGATED_WRITE_ALLOWLIST = {
-  drive_extract_text: "ephemeral internal temp-file copy+delete, no persisted external mutation (see comment above)",
+  drive_extract_text:
+    "OCR — рутинный вопрос-чтение («что в этом скане?»); гейт на каждый такой вызов приучил бы штамповать " +
+    "подтверждения. Но это WRITE и он больше не притворяется: Google-OCR обязан материализовать настоящий " +
+    "Google Doc в Диске владельца, поэтому readOnlyHint снят, черновая копия уезжает в КОРЗИНУ (не files.delete), " +
+    "identity-guard не даёт тронуть ничего, кроме нашего же «gmcp-ocr-tmp», а провалившаяся уборка попадает в " +
+    "ОТВЕТ инструмента, а не только в лог — см. scripts/test-ocr-cleanup.mjs.",
+  drive_confirm_upload:
+    "ничего не мутирует — статус-запрос; адрес НЕ приходит от модели (сервер хранит его сам, наружу отдан " +
+    "непрозрачный sessionId), исходящий запрос идёт через safeGoogleFetch. Но исходящий запрос — это не " +
+    "read-only, поэтому readOnlyHint снят (2026-08-06): пометка прятала тул от этой самой проверки.",
 };
 
 /** Every gated write tool, with args that reach its plan phase, which
@@ -320,7 +335,7 @@ for (const [name, spec] of Object.entries(GATED_TOOLS)) {
 }
 
 console.log("\n[5] read tools genuinely carry readOnlyHint (spot-check, not exhaustive)");
-for (const name of ["drive_search", "drive_get_metadata", "drive_download_file", "drive_get_permissions", "drive_extract_text", "drive_confirm_upload", "drive_consent_audit", "docs_list", "docs_read", "list_accounts"]) {
+for (const name of ["drive_search", "drive_get_metadata", "drive_download_file", "drive_get_permissions", "drive_consent_audit", "docs_list", "docs_read", "list_accounts"]) {
   const t = tools.find((x) => x.name === name);
   check(`${name} readOnlyHint: true`, t?.annotations?.readOnlyHint === true, JSON.stringify(t?.annotations));
 }

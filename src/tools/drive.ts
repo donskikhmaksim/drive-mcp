@@ -429,6 +429,79 @@ export async function postVerifyPermissionRemoved(
 
 const GOOGLE_DOC_MIME = "application/vnd.google-apps.document";
 
+// ── OCR scratch file: creation, identity guard, and honest cleanup ──────────
+//
+// Drive's OCR has no "read text" endpoint: the only way in is files.copy with
+// mimeType=Google Doc, i.e. a REAL file materialised in the owner's Drive. That
+// makes drive_extract_text a write, however read-shaped it looks from outside —
+// see the long comment on its registration below for why it stays ungated and
+// what has to hold for that to be safe.
+
+/** Name every OCR scratch copy carries — also the identity guard's marker. */
+const OCR_TEMP_NAME = "gmcp-ocr-tmp";
+
+/** A temp OCR file that is STILL IN THE USER'S DRIVE after the call. */
+export interface OcrCleanupFailure {
+  tempFileId: string;
+  /** Why it could not be cleaned up — verbatim, never swallowed. */
+  error: string;
+}
+
+/**
+ * Moves the temporary OCR document to the trash, having first checked that the
+ * id really points at OUR scratch doc.
+ *
+ * Two deliberate choices, both reactions to how the old one-liner
+ * (`files.delete(...).catch(() => {})`) failed:
+ *
+ *  - TRASH, not delete. Permanent deletion must never be a side effect of a
+ *    text-extraction call: if `docId` were ever wrong (a Drive bug, a future
+ *    refactor threading in a caller-supplied id), `files.delete` would destroy
+ *    a real user file with no recovery, while trashing is undoable for 30 days.
+ *  - IDENTITY GUARD. Before touching anything, re-read the file and require
+ *    name+mimeType to match the scratch doc this call just created. A mismatch
+ *    means we do NOT touch it and report instead — the same "never act on an
+ *    object you did not verify" rule the mutating tools use post-verify for.
+ *
+ * @returns `null` on success, or a description of the leftover file. The caller
+ *   MUST surface a non-null result to the user: a cleanup failure that is only
+ *   logged is invisible to the person whose Drive is accumulating the garbage.
+ */
+export async function cleanupOcrTempDoc(
+  g: GoogleClients,
+  docId: string,
+  toolName: string,
+): Promise<OcrCleanupFailure | null> {
+  try {
+    const meta = await g.drive.files.get({ fileId: docId, fields: "id,name,mimeType,trashed" });
+    const name = meta.data.name ?? "";
+    const mime = meta.data.mimeType ?? "";
+    if (name !== OCR_TEMP_NAME || mime !== GOOGLE_DOC_MIME) {
+      throw new Error(
+        `identity guard: ${docId} is «${safeText(name, 80)}» (${safeText(mime, 60)}), not this call's ` +
+          `temporary «${OCR_TEMP_NAME}» Google Doc — left untouched on purpose.`,
+      );
+    }
+    if (meta.data.trashed) return null;
+    await g.drive.files.update({ fileId: docId, requestBody: { trashed: true } });
+    return null;
+  } catch (e: unknown) {
+    const error = e instanceof Error ? e.message : String(e);
+    // Logged AND returned: the log is for the operator, the return value is for
+    // the person who asked — they are the one who has to delete the leftover.
+    console.error(`[${toolName}] temp OCR doc ${docId} was NOT cleaned up — it stays in Drive:`, error);
+    return { tempFileId: docId, error };
+  }
+}
+
+/** Human-readable warning naming every leftover, so it cannot pass unnoticed. */
+export function ocrLeftoverWarning(leftovers: OcrCleanupFailure[]): string {
+  return (
+    `⚠️ ${leftovers.length} temporary OCR file(s) could NOT be cleaned up and are STILL in the Drive ` +
+    `(delete them by id: ${leftovers.map((l) => l.tempFileId).join(", ")}). Tell the user — do not hide this.`
+  );
+}
+
 /** Raw Drive upload endpoint (resumable sessions bypass the googleapis client). */
 const UPLOAD_ENDPOINT = "https://www.googleapis.com/upload/drive/v3/files";
 
@@ -2264,7 +2337,16 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           .min(1)
           .describe("Array of upload sessions to check."),
       },
-      annotations: { readOnlyHint: true },
+      // Server-side this mutates nothing — it reads back an upload that already
+      // happened. But it does so with a real OUTBOUND request (safeGoogleFetch),
+      // so `readOnlyHint: true` — which it carried until 2026-08-06 — was never
+      // true in the sense the annotation implies. That matters beyond tidiness:
+      // a reflexive gate-coverage test classifies tools by that annotation, so
+      // a self-declared "read" is invisible to it. The address no longer comes
+      // from the model (opaque sessionId + server-side store) and the outbound
+      // call is host-pinned, so no gate is warranted — the honest label is
+      // "not read-only, deliberately ungated", matching gmail_confirm_upload.
+      annotations: { openWorldHint: true },
     },
     guard(async ({ account, sessions }) => {
       const results = await Promise.all(
@@ -2681,14 +2763,30 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
   );
 
   // ── Extract text (OCR) ─────────────────────────────────────────────────────
-  // NOT gated — deliberate, and NOT in scope of the consent-gate port
-  // (mcp-development-standard/references/gate.md §3.1 covers write tools;
-  // this one is functionally a read). It DOES call files.copy + files.delete
-  // internally, but only against a server-named temporary file
-  // ("gmcp-ocr-tmp") that is created and destroyed within the same call and
-  // never left behind or exposed — there is no persisted, externally-visible
-  // mutation for a human to approve. Marked readOnlyHint so the gate-coverage
-  // reflective test classifies it correctly instead of demanding a gate.
+  // NOT gated — a deliberate, and NARROW, exemption. Rationale: OCR is a
+  // routine read ("what does this scanned invoice say?"); a plan/confirm
+  // round-trip on every such question trains the owner to rubber-stamp
+  // confirmations, which is how a gate quietly stops being a gate.
+  //
+  // What this tool is NOT is read-only, and it no longer claims to be. Drive's
+  // OCR physically requires materialising a REAL Google Doc copy in the
+  // owner's Drive (it costs quota, shows up in the activity feed and in
+  // "Recent"), and for a file someone merely SHARED with the owner that copy is
+  // a new object in the owner's Drive. `readOnlyHint: true` used to hide all of
+  // that from scripts/test-gate-coverage.mjs — which is exactly why the
+  // allowlist entry there never fired. The annotation is gone; the tool is now
+  // classified as a write by the source scan and must stay accounted for in
+  // that test's UNGATED_WRITE_ALLOWLIST, with a reason.
+  //
+  // Three properties are what make the exemption defensible rather than a
+  // hidden hole (see cleanupOcrTempDoc above):
+  //  1. the temp copy goes to the TRASH, never files.delete — irreversible
+  //     deletion must not be a side effect of reading text;
+  //  2. an identity guard re-reads the copy first and refuses to touch anything
+  //     that is not our own "gmcp-ocr-tmp" Google Doc;
+  //  3. a cleanup that fails is REPORTED in this tool's own result (id + error)
+  //     as well as logged — garbage the user is told about can be removed;
+  //     garbage swallowed by `.catch(() => {})` accumulates forever unseen.
 
   server.registerTool(
     "drive_extract_text",
@@ -2696,7 +2794,9 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       title: "Extract text from PDFs/images (OCR)",
       description:
         "Extract text from one or more Drive files (PDF, scan, or image) using Google Drive's built-in OCR. " +
-        "Converts each to a temporary Google Doc, reads the text, and cleans up.",
+        "NOT a pure read: Google's OCR only works on a Google Doc, so this makes a temporary Google Doc copy " +
+        `("${OCR_TEMP_NAME}") in YOUR Drive for each file, reads the text, then moves that copy to the trash. ` +
+        "If a copy cannot be cleaned up, the result says so explicitly and names the leftover file id.",
       inputSchema: {
         account,
         fileIds: z.array(z.string()).min(1).describe("Array of Drive file IDs (PDFs/images)."),
@@ -2705,20 +2805,26 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           .optional()
           .describe("Optional language hint, e.g. 'en', 'ru'. Improves OCR accuracy."),
       },
-      annotations: { readOnlyHint: true },
+      // No readOnlyHint: this creates and trashes a real Drive file. Reversible
+      // (trash, not permanent delete) → destructiveHint: false.
+      annotations: { destructiveHint: false },
     },
     guard(async ({ account, fileIds, ocrLanguage }) => {
       const g = clients.resolve(account);
+      const leftovers: OcrCleanupFailure[] = [];
       const results = await mapWithLimit(fileIds, async (fileId) => {
         let docId: string | null = null;
         try {
           const copy = await g.drive.files.copy({
             fileId,
             ocrLanguage,
-            requestBody: { name: "gmcp-ocr-tmp", mimeType: GOOGLE_DOC_MIME },
+            requestBody: { name: OCR_TEMP_NAME, mimeType: GOOGLE_DOC_MIME },
             fields: "id",
           });
-          docId = copy.data.id!;
+          docId = copy.data.id ?? null;
+          if (!docId) {
+            throw new Error("Google Drive did not return a file id for the temporary OCR copy.");
+          }
           const doc = await g.docs.documents.get({ documentId: docId });
           const text = documentToPlainText(doc.data);
           return { fileId, text };
@@ -2726,12 +2832,14 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           return { fileId, error: e instanceof Error ? e.message : String(e) };
         } finally {
           if (docId) {
-            await g.drive.files.delete({ fileId: docId }).catch(() => {});
+            const failure = await cleanupOcrTempDoc(g, docId, "drive_extract_text");
+            if (failure) leftovers.push(failure);
           }
         }
       });
       return ok({
         summary: `📄 Extracted text from ${fileIds.length} file(s) via OCR`,
+        ...(leftovers.length ? { warning: ocrLeftoverWarning(leftovers), leftoverTempFiles: leftovers } : {}),
         results,
       });
     }),
