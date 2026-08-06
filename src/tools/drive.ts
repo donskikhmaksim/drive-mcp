@@ -12,6 +12,7 @@ import type { GoogleClients } from "../google.js";
 import { documentToPlainText } from "./docs.js";
 import {
   issueDownloadLink,
+  resolveDownloadLink,
   downloadsAvailable,
   DEFAULT_TTL_MINUTES,
   MAX_TTL_MINUTES,
@@ -186,8 +187,12 @@ export async function buildMutationResult<T extends { error?: string }>(opts: {
   consentStore?: ConsentStore;
   auditId?: string;
   preSnapshot?: unknown;
+  /** Extra top-level fields to merge into the result object (e.g. a `note`
+   * the tool must keep showing next to its results). Never overrides
+   * `summary`/`results`/`verification`. */
+  extra?: Record<string, unknown>;
 }): Promise<ReturnType<typeof ok>> {
-  const { results, total, verb, summaryIcon, verify, reportTitle, reportSubtitle, consentStore, auditId, preSnapshot } = opts;
+  const { results, total, verb, summaryIcon, verify, reportTitle, reportSubtitle, consentStore, auditId, preSnapshot, extra } = opts;
   const succeeded = results.filter((r) => !r.error);
   const pv = await mapWithLimit(succeeded, (r) => verify(r));
   const okN = succeeded.length;
@@ -220,6 +225,7 @@ export async function buildMutationResult<T extends { error?: string }>(opts: {
       });
   }
   return ok({
+    ...(extra ?? {}),
     summary: `${icon} ${verb} ${okN}/${total}${tail}`,
     results,
     ...(pv.length ? { verification: renderVerifyReport(reportTitle, reportSubtitle, pv) } : {}),
@@ -429,6 +435,67 @@ const GOOGLE_DOC_MIME = "application/vnd.google-apps.document";
 /** Raw Drive upload endpoint (resumable sessions bypass the googleapis client). */
 const UPLOAD_ENDPOINT = "https://www.googleapis.com/upload/drive/v3/files";
 
+/** Path of the upload endpoint above ("/upload/drive/v3/files"), DERIVED from
+ * the constant so the allowlist below can never drift from the real endpoint. */
+const UPLOAD_PATH_PREFIX = new URL(UPLOAD_ENDPOINT).pathname;
+
+/** Hard timeout for the raw (non-googleapis) upload/status requests, ms.
+ * limits-audit.md §10: an outgoing request without a timeout hangs a worker. */
+const UPLOAD_FETCH_TIMEOUT_MS = 30_000;
+
+/**
+ * Strict allowlist check for a resumable-session URI that arrived as a TOOL
+ * ARGUMENT (`drive_confirm_upload`'s `uploadUrl`).
+ *
+ * Why an allowlist and not the generic "block private IPs" SSRF filter
+ * (security-checklist.md §2): this server reads the owner's files, i.e. it
+ * routinely processes text written by OTHER people, which can carry
+ * instructions aimed at the model ("check this upload: https://…"). The model
+ * then hands that URL here and the server would PUT to it with its own
+ * network position — inside Railway's perimeter, next to cloud metadata
+ * (169.254.169.254) and to localhost ports of the container. The response body
+ * used to come back inside the tool result, so it was not blind SSRF but full
+ * read. A resumable session URI can only ever live on Google's upload host, so
+ * the narrow allowlist is both stronger and simpler than a private-range
+ * blocklist (which DNS rebinding and redirects routinely walk around).
+ *
+ * Every check is done on a PARSED `URL` — never on substrings: `.includes(
+ * "googleapis.com")` accepts `https://evil.example.com/googleapis.com/x`,
+ * `https://googleapis.com.evil.com/x` and `https://evil-googleapis.com/x`.
+ *
+ * Throws (with a Russian, human-readable reason) instead of returning a flag,
+ * so a caller cannot forget to check the result.
+ */
+export function assertGoogleUploadUrl(raw: string): URL {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error("адрес сессии загрузки не является валидным URL");
+  }
+  if (u.protocol !== "https:") {
+    throw new Error(`разрешён только https, получено «${u.protocol.replace(/:$/, "")}»`);
+  }
+  if (u.username !== "" || u.password !== "") {
+    throw new Error("адрес содержит логин/пароль (user:pass@) — такие адреса не принимаются");
+  }
+  if (u.port !== "" && u.port !== "443") {
+    throw new Error(`разрешён только порт 443, получен ${u.port}`);
+  }
+  // hostname: lower-case + drop a single trailing dot ("www.googleapis.com."
+  // is the same host for DNS but a different string).
+  const host = u.hostname.toLowerCase().replace(/\.$/, "");
+  const hostAllowed =
+    host === "googleapis.com" || host === "www.googleapis.com" || host.endsWith(".googleapis.com");
+  if (!hostAllowed) {
+    throw new Error(`хост «${host}» не входит в список разрешённых (только *.googleapis.com)`);
+  }
+  if (u.pathname !== UPLOAD_PATH_PREFIX && !u.pathname.startsWith(`${UPLOAD_PATH_PREFIX}/`)) {
+    throw new Error(`путь «${u.pathname}» не является upload-эндпоинтом Drive (${UPLOAD_PATH_PREFIX})`);
+  }
+  return u;
+}
+
 /** Metadata Google echoes back when a resumable upload finalises. */
 const UPLOAD_FIELDS = "id,name,mimeType,size,webViewLink";
 
@@ -444,6 +511,19 @@ async function errorBody(res: Response): Promise<string> {
     return "<unreadable body>";
   }
   return text.length > 500 ? `${text.slice(0, 500)}… (truncated)` : text;
+}
+
+/**
+ * Классифицированное пояснение к HTTP-коду от Google — БЕЗ тела ответа.
+ * Нужно там, где адрес запроса пришёл аргументом инструмента: тело такого
+ * ответа наружу не пересказывается вообще (security-checklist.md §6).
+ */
+function explainUploadStatus(status: number): string {
+  if (status === 401 || status === 403) return "Нет доступа к этой сессии загрузки (истёк токен или чужая сессия).";
+  if (status === 429) return "Слишком много запросов — повторите позже.";
+  if (status >= 500) return "Временная ошибка на стороне Google — повторите позже.";
+  if (status >= 400) return "Запрос отклонён. Проверьте, что сессия создана drive_create_upload_session и ещё жива.";
+  return "Неожиданный ответ для запроса статуса загрузки.";
 }
 
 /** Default export format for Google-native files when none is given. */
@@ -1180,6 +1260,159 @@ registerAutoExecutor("drive_overwrite_file", {
     const p = payload as OverwritePayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeOverwriteCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ── drive_get_download_url ───────────────────────────────────────────────
+// ГЕЙТОВАН (было: без подтверждения). Инструмент ВЫДАЁТ ПОЛНОМОЧИЕ: ссылку,
+// по которой файл скачает КТО УГОДНО, без входа в Google-аккаунт, до 24 часов,
+// без возможности отзыва (`src/downloads.ts` — токен живёт до истечения TTL,
+// одноразовости нет намеренно, чтобы не ломать докачку). По радиусу поражения
+// это ровно то же, что `drive_share` с type=anyone, который подтверждение
+// требует — поэтому и здесь plan→execute, `destructiveHint: true` и REAL
+// binding.
+// Binding — снимок ЖИВЫХ {fileId, name, mimeType, size} + запрошенный TTL:
+// именно эта четвёрка (плюс срок) определяет выдаваемое полномочие, и её
+// дрейф между планом и исполнением («файл подменили содержимым/именем»)
+// обязан ловиться.
+
+export interface DownloadUrlItem {
+  fileId: string;
+  exportMimeType?: string;
+}
+export interface DownloadUrlPayload {
+  account: string;
+  files: DownloadUrlItem[];
+  ttlMinutes?: number;
+}
+
+async function downloadUrlBindingSnapshot(g: GoogleClients, files: DownloadUrlItem[]) {
+  return mapWithLimit(files, async (f) => {
+    const meta = await liveFileMeta(g, f.fileId);
+    return {
+      fileId: f.fileId,
+      name: meta?.name ?? null,
+      mimeType: meta?.mimeType ?? null,
+      size: meta?.size ?? null,
+    };
+  });
+}
+
+async function downloadUrlRehash(g: GoogleClients, addressing: ConsentAddressing): Promise<string> {
+  const a = addressing as DownloadUrlPayload;
+  const snapshot = await downloadUrlBindingSnapshot(g, a.files);
+  return sha256({ account: a.account, files: a.files, ttlMinutes: a.ttlMinutes ?? DEFAULT_TTL_MINUTES, snapshot });
+}
+
+/** Post-verify выданной ссылки: НЕЗАВИСИМО перечитываем её из хранилища
+ * ссылок (`resolveDownloadLink`) и сверяем, что токен жив и ведёт ровно на
+ * тот файл, на который согласился человек — а не доверяем возврату
+ * `issueDownloadLink` (identity-postverify.md §5). */
+async function postVerifyDownloadLink(
+  fileId: string,
+  label: string,
+  url: string,
+  expiresAt: string,
+): Promise<VerifyLine> {
+  const lbl = safeText(label) || "(файл)";
+  const token = url.split("/dl/")[1] ?? "";
+  const target = token ? await resolveDownloadLink(token) : null;
+  if (!target) {
+    return { outcome: "mismatch", line: `- ❌ **«${lbl}»** — выданная ссылка не найдена в хранилище: она не сработает` };
+  }
+  if (target.fileId !== fileId) {
+    return { outcome: "mismatch", line: `- ❌ **«${lbl}»** — ссылка ведёт на ДРУГОЙ файл (${safeText(target.fileId, 40)})` };
+  }
+  return {
+    outcome: "ok",
+    line: `- ✅ **«${lbl}»** — ссылка выдана и перепроверена: ведёт ровно на этот файл, действует до ${safeText(expiresAt, 40)} (вход в аккаунт НЕ требуется)`,
+  };
+}
+
+async function executeDownloadUrlCore(
+  g: GoogleClients,
+  payload: DownloadUrlPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+  defaultAccount: string,
+): Promise<CallToolResult> {
+  const preSnapshot = await downloadUrlBindingSnapshot(g, payload.files);
+  interface LinkResult {
+    fileId: string;
+    name?: string | null;
+    mimeType?: string | null;
+    size?: string | null;
+    downloadUrl?: string;
+    expiresAt?: string;
+    error?: string;
+  }
+  const results = await mapWithLimit<DownloadUrlItem, LinkResult>(payload.files, async ({ fileId, exportMimeType }) => {
+    try {
+      const meta = await g.drive.files.get({
+        fileId,
+        fields: "id,name,mimeType,size",
+        supportsAllDrives: true,
+      });
+      const mime = meta.data.mimeType ?? "application/octet-stream";
+      const isNative = mime.startsWith("application/vnd.google-apps.");
+      const exportMime = isNative ? exportMimeType ?? defaultExportMime(mime) : undefined;
+      const name = exportMime
+        ? withExportExtension(meta.data.name ?? "file", exportMime)
+        : meta.data.name ?? "file";
+      const { url, expiresAt } = await issueDownloadLink(
+        {
+          account: payload.account || defaultAccount,
+          fileId,
+          exportMime,
+          name,
+          mimeType: exportMime ?? mime,
+          size: meta.data.size ? Number(meta.data.size) : undefined,
+        },
+        payload.ttlMinutes ?? DEFAULT_TTL_MINUTES,
+      );
+      return {
+        fileId,
+        name,
+        mimeType: exportMime ?? mime,
+        // Exports are generated on the fly, so their size is unknown up front.
+        size: exportMime ? null : meta.data.size ?? null,
+        downloadUrl: url,
+        expiresAt,
+      };
+    } catch (e: unknown) {
+      return { fileId, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+  return buildMutationResult({
+    results,
+    total: payload.files.length,
+    verb: "Issued",
+    summaryIcon: "🔗",
+    verify: (r) => postVerifyDownloadLink(r.fileId, r.name ?? r.fileId, r.downloadUrl ?? "", r.expiresAt ?? ""),
+    reportTitle: "Независимая проверка выданных ссылок",
+    reportSubtitle: "выдано ⇄ живое хранилище ссылок сервера",
+    consentStore,
+    auditId,
+    preSnapshot,
+    extra: {
+      note:
+        "Каждая ссылка работает БЕЗ входа в Google-аккаунт, пока не истечёт, и отозвать её нельзя — " +
+        "это пароль от этого одного файла. Передавайте только тому, кто просил.",
+    },
+  });
+}
+
+registerAutoExecutor("drive_get_download_url", {
+  rehash: (addressing, ctx: AutoExecutorCtx) => {
+    const p = addressing as DownloadUrlPayload;
+    const g = ctx.clients.resolve(p.account);
+    return downloadUrlRehash(g, addressing);
+  },
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as DownloadUrlPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeDownloadUrlCore(g, p, auditId, ctx.consentStore, p.account);
     return extractText(result);
   },
 });
@@ -2043,22 +2276,82 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           .min(1)
           .describe("Array of upload sessions to check."),
       },
-      annotations: { readOnlyHint: true },
+      // NO readOnlyHint: this tool makes an outgoing HTTP request (a PUT) to an
+      // address that arrives as an ARGUMENT — a real side effect leaving this
+      // server, and exactly the surface the SSRF gate above guards. Marking it
+      // read-only hid it from the reflective coverage test (classification.md
+      // §2: the annotation is a permission-grouping signal, and a wrong one
+      // makes a tool invisible). It stays UNGATED on purpose — see the comment
+      // above, and its written reason in scripts/test-gate-coverage.mjs's
+      // UNGATED_WRITE_ALLOWLIST.
+      annotations: { destructiveHint: false, openWorldHint: true },
     },
     guard(async ({ account, sessions }) => {
       const g = clients.resolve(account);
+
+      // ── SSRF-гейт (security-checklist.md §2) ────────────────────────────
+      // `uploadUrl` — аргумент, пришедший от модели, а модель читает файлы
+      // владельца (то есть текст, написанный посторонними). Проверяем ВЕСЬ
+      // батч ДО первого сетевого вызова и при любом отклонённом адресе не
+      // отправляем НИ ОДНОГО запроса (fail-closed): иначе валидный первый
+      // элемент батча уже унёс бы сервер во внутреннюю сеть.
+      const checked = sessions.map((s) => {
+        try {
+          assertGoogleUploadUrl(s.uploadUrl);
+          return { uploadUrl: s.uploadUrl, reason: null as string | null };
+        } catch (e: unknown) {
+          return { uploadUrl: s.uploadUrl, reason: e instanceof Error ? e.message : String(e) };
+        }
+      });
+      const rejected = checked.filter((c) => c.reason);
+      if (rejected.length) {
+        return ok({
+          summary:
+            `🛑 Адрес сессии загрузки не прошёл проверку — ни один запрос не отправлен ` +
+            `(${rejected.length} из ${sessions.length})`,
+          results: checked.map((c) => ({
+            uploadUrl: c.uploadUrl,
+            error:
+              c.reason ??
+              "не проверялся: в этом же вызове есть отклонённый адрес, поэтому весь вызов отменён целиком",
+          })),
+          note:
+            "Ссылка на сессию загрузки должна быть та, которую вернул drive_create_upload_session " +
+            "(https://www.googleapis.com/upload/drive/v3/files…). Сервер не ходит по произвольным адресам.",
+        });
+      }
+
       const results = await Promise.all(
         sessions.map(async ({ uploadUrl, sizeBytes }) => {
           try {
             // A zero-length PUT with "bytes */<total>" asks Google for the current status;
             // the session URI itself carries the upload_id, so no Authorization is needed.
+            // redirect: "manual" — редирект это штатный обход SSRF-фильтра
+            // (разрешённый хост отвечает 302 на 169.254.169.254), поэтому за
+            // Location НИКОГДА не идём (см. проверку сразу после fetch).
             const res = await fetch(uploadUrl, {
               method: "PUT",
               headers: {
                 "Content-Range": `bytes */${sizeBytes ?? "*"}`,
                 "Content-Length": "0",
               },
+              redirect: "manual",
+              signal: AbortSignal.timeout(UPLOAD_FETCH_TIMEOUT_MS),
             });
+
+            // ВАЖНО: штатный ответ «докачивай дальше» — это 308 с заголовком
+            // `Range` и БЕЗ `Location`. Поэтому редирект отличаем именно по
+            // наличию `Location`, а не по коду статуса (308 сам по себе —
+            // нормальный ответ resumable-протокола, см. ветку ниже).
+            const location = res.headers.get("location");
+            if (location) {
+              return {
+                uploadUrl,
+                error:
+                  `Google ответил перенаправлением (HTTP ${res.status}) — сервер за редиректом не идёт ` +
+                  "(защита от SSRF). Создайте сессию загрузки заново.",
+              };
+            }
 
             if (res.status === 200 || res.status === 201) {
               // The session was created with `fields=`, so the finalising response already
@@ -2134,7 +2427,15 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
               };
             }
 
-            return { uploadUrl, error: `Google returned ${res.status}: ${await errorBody(res)}` };
+            // Тело ответа СЮДА НЕ ПОПАДАЕТ (в отличие от остальных мест, где
+            // errorBody применяется к ответам по захардкоженным адресам):
+            // адрес здесь пришёл аргументом, и пересказ тела наружу — готовый
+            // канал эксфильтрации (security-checklist.md §2/§6). Наружу идёт
+            // только код статуса + классифицированное пояснение по-русски.
+            return {
+              uploadUrl,
+              error: `Google вернул HTTP ${res.status}. ${explainUploadStatus(res.status)}`,
+            };
           } catch (e: unknown) {
             return { uploadUrl, error: e instanceof Error ? e.message : String(e) };
           }
@@ -2335,6 +2636,11 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
   );
 
   // ── Download links (client fetches the bytes itself) ───────────────────────
+  // CONSENT-GATED (mcp-development-standard/references/gate.md): the link is a
+  // capability that works WITHOUT any sign-in, for up to 24 hours, and cannot
+  // be revoked — the same radius as drive_share with type=anyone, which has
+  // always required consent. See the block comment above
+  // `executeDownloadUrlCore` for the binding rationale.
 
   server.registerTool(
     "drive_get_download_url",
@@ -2346,9 +2652,13 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         "or binary, or whenever the user wants to keep the file rather than read its content here. " +
         "Google-native files (Docs/Sheets/Slides) are exported on the fly — default doc→text, sheet→csv, else pdf; " +
         "override with exportMimeType. " +
-        "The link IS the credential: anyone holding it can fetch that one file until it expires " +
-        `(default ${DEFAULT_TTL_MINUTES} minutes, max ${MAX_TTL_MINUTES / 60} hours), so pass it only to the person who asked. ` +
-        "It grants access to that single file and nothing else.",
+        "The link IS the credential: anyone holding it can fetch that one file WITHOUT signing in, until it expires " +
+        `(default ${DEFAULT_TTL_MINUTES} minutes, max ${MAX_TTL_MINUTES / 60} hours), and it cannot be revoked — ` +
+        "so pass it only to the person who asked. It grants access to that single file and nothing else. " +
+        "Two-mode consent-gated tool (mcp-development-standard/references/gate.md): call WITHOUT " +
+        "`manifest_id`/`user_reply` (with `files`) to build a plan and return a preview — NO link is issued yet. " +
+        "Show the preview to the user verbatim and wait for their reply. Call again with the returned " +
+        "`manifest_id` and the user's VERBATIM `user_reply` to actually issue the link(s).",
       inputSchema: {
         account,
         files: z
@@ -2361,19 +2671,27 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
                 .describe("Override export format for Google-native files, e.g. 'application/pdf'."),
             }),
           )
-          .min(1)
-          .describe("Array of files to build links for."),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
         ttlMinutes: z
           .number()
           .int()
           .min(1)
           .max(MAX_TTL_MINUTES)
           .optional()
-          .describe(`How long each link stays valid. Default ${DEFAULT_TTL_MINUTES} minutes.`),
+          .describe(`How long each link stays valid. Default ${DEFAULT_TTL_MINUTES} minutes, max ${MAX_TTL_MINUTES}.`),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
-      annotations: { readOnlyHint: true },
+      annotations: { destructiveHint: true },
     },
-    guard(async ({ account, files, ttlMinutes }) => {
+    guard(async ({ account, files, ttlMinutes, manifest_id, user_reply }) => {
       if (!downloadsAvailable()) {
         return fail(
           "Download links are unavailable: this server does not know its own public URL. " +
@@ -2381,63 +2699,71 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
             "drive_download_file still works for small files.",
         );
       }
+      const { consentStore, consentCfg, tg } = ctx;
+      if (!consentStore) {
+        return fail(
+          "Выдача ссылок на скачивание недоступна: не настроено хранилище согласия (DATABASE_URL). Без него " +
+            "сервер не может провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        files.map(async ({ fileId, exportMimeType }) => {
-          try {
-            const meta = await g.drive.files.get({
-              fileId,
-              fields: "id,name,mimeType,size",
-              supportsAllDrives: true,
-            });
-            const mime = meta.data.mimeType ?? "application/octet-stream";
-            const isNative = mime.startsWith("application/vnd.google-apps.");
-            const exportMime = isNative ? exportMimeType ?? defaultExportMime(mime) : undefined;
-            const name = exportMime
-              ? withExportExtension(meta.data.name ?? "file", exportMime)
-              : meta.data.name ?? "file";
-            const { url, expiresAt } = await issueDownloadLink(
-              {
-                account: account ?? clients.defaultName,
-                fileId,
-                exportMime,
-                name,
-                mimeType: exportMime ?? mime,
-                size: meta.data.size ? Number(meta.data.size) : undefined,
-              },
-              ttlMinutes ?? DEFAULT_TTL_MINUTES,
-            );
-            return {
-              fileId,
-              name,
-              mimeType: exportMime ?? mime,
-              // Exports are generated on the fly, so their size is unknown up front.
-              size: exportMime ? null : meta.data.size ?? null,
-              downloadUrl: url,
-              expiresAt,
-            };
-          } catch (e: unknown) {
-            return { fileId, error: e instanceof Error ? e.message : String(e) };
+      const accountName = account ?? clients.defaultName;
+
+      const decision = await requireConsent<DownloadUrlPayload>({
+        tool: "drive_get_download_url",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        tg,
+        plan: async () => {
+          if (!files || !files.length) {
+            throw new Error("Нужен непустой `files`, чтобы построить план выдачи ссылок.");
           }
-        }),
-      );
-      return ok({
-        summary: `🔗 Built ${files.length} download link(s)`,
-        results,
-        note: "Each link works without any further sign-in until it expires — treat it as a password for that one file.",
+          const ttl = ttlMinutes ?? DEFAULT_TTL_MINUTES;
+          const snapshot = await downloadUrlBindingSnapshot(g, files);
+          const payload: DownloadUrlPayload = { account: accountName, files, ttlMinutes: ttl };
+          const hours = Math.floor(ttl / 60);
+          const mins = ttl % 60;
+          const human = hours ? `${hours} ч${mins ? ` ${mins} мин` : ""}` : `${mins} мин`;
+          const lines = snapshot.map((s) => {
+            const size = s.size ? `, ${s.size} байт` : "";
+            return `- **«${safeText(s.name ?? s.fileId, 60)}»** (${safeText(s.mimeType ?? "тип неизвестен", 40)}${size}) — ссылка на скачивание`;
+          });
+          const preview =
+            `### 📤 План: Ссылки на скачивание БЕЗ входа в аккаунт — ${files.length}\n\n` +
+            `${lines.join("\n")}\n\n` +
+            `⚠️ Сама ссылка и есть пропуск: файл скачает ЛЮБОЙ, кто её получит, — ` +
+            `БЕЗ входа в Google-аккаунт и без пароля. Срок жизни — ${human} ` +
+            `(максимум ${MAX_TTL_MINUTES / 60} ч). Отозвать выданную ссылку нельзя, ` +
+            `она перестанет работать только когда истечёт.`;
+          const objectHash = sha256({ account: accountName, files, ttlMinutes: ttl, snapshot });
+          return { payload, objectHash, preview, batchSize: files.length };
+        },
+        rehash: (addressing) => downloadUrlRehash(g, addressing),
       });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      return executeDownloadUrlCore(g, payload, auditId, consentStore, clients.defaultName);
     }),
   );
 
   // ── Extract text (OCR) ─────────────────────────────────────────────────────
-  // NOT gated — deliberate, and NOT in scope of the consent-gate port
-  // (mcp-development-standard/references/gate.md §3.1 covers write tools;
-  // this one is functionally a read). It DOES call files.copy + files.delete
-  // internally, but only against a server-named temporary file
-  // ("gmcp-ocr-tmp") that is created and destroyed within the same call and
-  // never left behind or exposed — there is no persisted, externally-visible
-  // mutation for a human to approve. Marked readOnlyHint so the gate-coverage
-  // reflective test classifies it correctly instead of demanding a gate.
+  // NOT gated — deliberate (gate.md §3.1 covers write tools; for the USER this
+  // one is a read: it never touches their file). It DOES call files.copy +
+  // files.delete, but only against a server-named temporary copy
+  // ("gmcp-ocr-tmp") created and destroyed inside the same call; the user's
+  // own file is not modified.
+  // NO readOnlyHint, though: those ARE real writes into the owner's Drive, and
+  // files.delete is permanent (no trash). If the process dies between copy and
+  // delete, a stray "gmcp-ocr-tmp" file is left behind — a visible side effect,
+  // so the annotation would be a lie and would hide the tool from the coverage
+  // test. It is instead listed in scripts/test-gate-coverage.mjs's
+  // UNGATED_WRITE_ALLOWLIST with a written reason.
 
   server.registerTool(
     "drive_extract_text",
@@ -2454,7 +2780,10 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           .optional()
           .describe("Optional language hint, e.g. 'en', 'ru'. Improves OCR accuracy."),
       },
-      annotations: { readOnlyHint: true },
+      // NO readOnlyHint — see the comment above: files.copy + a permanent
+      // files.delete run against the owner's Drive, even though the user's own
+      // file is untouched.
+      annotations: { destructiveHint: false },
     },
     guard(async ({ account, fileIds, ocrLanguage }) => {
       const g = clients.resolve(account);

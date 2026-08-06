@@ -5,6 +5,12 @@
  * and no database is needed: without one, downloads.ts keeps links in memory,
  * which is the path exercised here.
  *
+ * drive_get_download_url is CONSENT-GATED (the issued link works without any
+ * sign-in, lives up to 24h and cannot be revoked), so the calls below go
+ * through plan → execute via `planExec`; blocks [9]-[12] cover the gate
+ * itself: the plan issues no link, a refusal issues no link, binding drift
+ * refuses, and the approved TTL is what actually gets issued.
+ *
  * Usage:
  *   npm test                          # builds, then runs this
  *   node scripts/test-download-links.mjs
@@ -51,14 +57,64 @@ const fakeClients = {
   baseGmailQuery: () => "",
 };
 
+// --- consent-gate fixture ---------------------------------------------------
+// drive_get_download_url is consent-gated (the link is a capability that works
+// without any sign-in and cannot be revoked), so every call below goes through
+// plan → execute. In-memory manifest store, same shape as test-resumable.mjs.
+
+const manifests = new Map();
+const consentStore = {
+  async createManifest(input) {
+    manifests.set(input.id, { ...input, status: "AWAITING_CONSENT", consumedAt: null, userReply: null });
+  },
+  async getManifest(id, server) {
+    const r = manifests.get(id);
+    return r && r.server === server ? { ...r } : null;
+  },
+  async consumeManifest(id, server, userReply) {
+    const r = manifests.get(id);
+    if (!r || r.server !== server || r.status !== "AWAITING_CONSENT") return null;
+    if (Date.now() >= r.expiresAt) return null;
+    r.status = "DONE";
+    r.userReply = userReply;
+    return { ...r };
+  },
+  async invalidateManifest(id, server, userReply) {
+    const r = manifests.get(id);
+    if (r && r.server === server && r.status === "AWAITING_CONSENT") {
+      r.status = "INVALIDATED";
+      r.userReply = userReply;
+    }
+  },
+  async appendConsentAudit() {},
+  async updateConsentAuditOutcome() {},
+};
+// minConsentGapMs: 0 — this fixture calls execute right after plan; the
+// anti-doublet check has its own coverage in test-consent.mjs.
+const consentCtx = {
+  consentStore,
+  consentCfg: { server: "drive", consentTtlMs: 3_600_000, minConsentGapMs: 0, sendBatchMax: 10 },
+  auditStore: null,
+};
+
 const server = new McpServer({ name: "drive-mcp-test", version: "0" });
-registerDriveTools(server, fakeClients);
+registerDriveTools(server, fakeClients, consentCtx);
 const client = new Client({ name: "test-client", version: "0" });
 const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
 await Promise.all([server.connect(serverSide), client.connect(clientSide)]);
 
 const raw = async (name, args) => client.callTool({ name, arguments: args });
-const call = async (name, args) => JSON.parse((await raw(name, args)).content[0].text);
+
+/** Full plan→execute round trip; returns the parsed execute-call result. */
+async function planExec(name, planArgs, userReply = "да") {
+  const planResp = await raw(name, planArgs);
+  const planBody = planResp.content[0].text;
+  const m = /план `([a-f0-9-]+)`/.exec(planBody);
+  if (!m) throw new Error(`${name}: no manifest id in plan response: ${planBody.slice(0, 300)}`);
+  const execResp = await raw(name, { manifest_id: m[1], user_reply: userReply });
+  return JSON.parse(execResp.content[0].text);
+}
+const call = async (name, args) => planExec(name, args);
 
 let failures = 0;
 const check = (label, cond, extra = "") => {
@@ -164,6 +220,60 @@ for (let i = 0; i < 20; i++) {
 }
 check("20 links → 20 distinct tokens", tokens.size === 20, String(tokens.size));
 check("tokens are long enough to be unguessable", [...tokens].every((t) => t.length >= 40), String([...tokens][0]?.length));
+
+// --- 9. consent gate --------------------------------------------------------
+// The link works without any sign-in, lives up to 24h and cannot be revoked —
+// so issuing one is gated exactly like drive_share.
+
+console.log("\n[9] gate: the plan phase issues NO link and spells out what is being handed out");
+{
+  const planResp = await raw("drive_get_download_url", { files: [{ fileId: "VIDEO" }] });
+  const planBody = planResp.content[0].text;
+  check("response is a plan, not a result", planBody.includes("### 📤 План"), planBody.slice(0, 80));
+  check("NO link handed out in the plan", !planBody.includes("/dl/"), planBody.slice(0, 200));
+  check("plan says the link needs no sign-in", /БЕЗ входа в/.test(planBody), planBody.slice(0, 300));
+  check("plan states the lifetime", /Срок жизни/.test(planBody), planBody.slice(0, 300));
+  check("plan says it cannot be revoked", /Отозвать выданную ссылку нельзя/.test(planBody), planBody.slice(0, 400));
+  check("plan names the file", planBody.includes("holiday.mp4"), planBody.slice(0, 300));
+}
+
+console.log("\n[10] gate: user says «нет» → 🛑, no link issued");
+{
+  const planResp = await raw("drive_get_download_url", { files: [{ fileId: "VIDEO" }] });
+  const id = /план `([a-f0-9-]+)`/.exec(planResp.content[0].text)[1];
+  const noResp = await raw("drive_get_download_url", { manifest_id: id, user_reply: "нет, не надо" });
+  const body = noResp.content[0].text;
+  check("refused with 🛑", body.includes("🛑"), body.slice(0, 80));
+  check("no link in the refusal", !body.includes("/dl/"), body.slice(0, 200));
+  const retry = await raw("drive_get_download_url", { manifest_id: id, user_reply: "да" });
+  check("invalidated manifest cannot be reused", retry.content[0].text.includes("🛑"), retry.content[0].text.slice(0, 80));
+}
+
+console.log("\n[11] gate: file drifts between plan and execute → 🛑, no link issued (real rehash)");
+{
+  const planResp = await raw("drive_get_download_url", { files: [{ fileId: "VIDEO" }] });
+  const id = /план `([a-f0-9-]+)`/.exec(planResp.content[0].text)[1];
+  const before = FILES.VIDEO.name;
+  FILES.VIDEO.name = "someone-else-replaced-this.mp4"; // concurrent change
+  const execResp = await raw("drive_get_download_url", { manifest_id: id, user_reply: "да" });
+  FILES.VIDEO.name = before;
+  const body = execResp.content[0].text;
+  check("binding drift refused with 🛑", body.includes("🛑") && /изменилось/.test(body), body.slice(0, 200));
+  check("no link issued on drift", !body.includes("/dl/"), body.slice(0, 200));
+}
+
+console.log("\n[12] gate: TTL is part of the binding (a different TTL is a different consent)");
+{
+  const planResp = await raw("drive_get_download_url", { files: [{ fileId: "VIDEO" }], ttlMinutes: 30 });
+  const planBody = planResp.content[0].text;
+  check("plan echoes the requested TTL", /30 мин/.test(planBody), planBody.slice(0, 300));
+  const id = /план `([a-f0-9-]+)`/.exec(planBody)[1];
+  const out = JSON.parse((await raw("drive_get_download_url", { manifest_id: id, user_reply: "да" })).content[0].text);
+  const ttlMin = (new Date(out.results[0].expiresAt).getTime() - Date.now()) / 60000;
+  check("issued link honours the approved TTL, not the default", ttlMin > 25 && ttlMin <= 30.1, String(ttlMin));
+  check("post-verify report attached", /Независимая проверка выданных ссылок/.test(out.verification ?? ""), String(out.verification).slice(0, 120));
+  check("result still carries the no-sign-in warning", /БЕЗ входа в Google-аккаунт/.test(out.note ?? ""), String(out.note));
+}
 
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);
 process.exit(failures === 0 ? 0 : 1);

@@ -11,7 +11,7 @@
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node scripts/test-resumable.mjs && node scripts/test-download-links.mjs && node scripts/test-credential-source.mjs && node scripts/test-consent.mjs && node scripts/test-gate-coverage.mjs && node scripts/test-drive-gate.mjs && node scripts/test-tg-approval.mjs && node scripts/test-tg-webhook-gate.mjs && node scripts/test-auto-execute.mjs"
+    "test": "npm run build && node scripts/test-resumable.mjs && node scripts/test-download-links.mjs && node scripts/test-credential-source.mjs && node scripts/test-consent.mjs && node scripts/test-gate-coverage.mjs && node scripts/test-drive-gate.mjs && node scripts/test-tg-approval.mjs && node scripts/test-tg-webhook-gate.mjs && node scripts/test-auto-execute.mjs && node scripts/test-confirm-upload-ssrf.mjs && node scripts/test-download-headers.mjs && node scripts/test-skill-version-injection.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
