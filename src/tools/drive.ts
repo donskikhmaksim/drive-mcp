@@ -2276,7 +2276,15 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           .min(1)
           .describe("Array of upload sessions to check."),
       },
-      annotations: { readOnlyHint: true },
+      // NO readOnlyHint: this tool makes an outgoing HTTP request (a PUT) to an
+      // address that arrives as an ARGUMENT — a real side effect leaving this
+      // server, and exactly the surface the SSRF gate above guards. Marking it
+      // read-only hid it from the reflective coverage test (classification.md
+      // §2: the annotation is a permission-grouping signal, and a wrong one
+      // makes a tool invisible). It stays UNGATED on purpose — see the comment
+      // above, and its written reason in scripts/test-gate-coverage.mjs's
+      // UNGATED_WRITE_ALLOWLIST.
+      annotations: { destructiveHint: false, openWorldHint: true },
     },
     guard(async ({ account, sessions }) => {
       const g = clients.resolve(account);
@@ -2745,14 +2753,17 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
   );
 
   // ── Extract text (OCR) ─────────────────────────────────────────────────────
-  // NOT gated — deliberate, and NOT in scope of the consent-gate port
-  // (mcp-development-standard/references/gate.md §3.1 covers write tools;
-  // this one is functionally a read). It DOES call files.copy + files.delete
-  // internally, but only against a server-named temporary file
-  // ("gmcp-ocr-tmp") that is created and destroyed within the same call and
-  // never left behind or exposed — there is no persisted, externally-visible
-  // mutation for a human to approve. Marked readOnlyHint so the gate-coverage
-  // reflective test classifies it correctly instead of demanding a gate.
+  // NOT gated — deliberate (gate.md §3.1 covers write tools; for the USER this
+  // one is a read: it never touches their file). It DOES call files.copy +
+  // files.delete, but only against a server-named temporary copy
+  // ("gmcp-ocr-tmp") created and destroyed inside the same call; the user's
+  // own file is not modified.
+  // NO readOnlyHint, though: those ARE real writes into the owner's Drive, and
+  // files.delete is permanent (no trash). If the process dies between copy and
+  // delete, a stray "gmcp-ocr-tmp" file is left behind — a visible side effect,
+  // so the annotation would be a lie and would hide the tool from the coverage
+  // test. It is instead listed in scripts/test-gate-coverage.mjs's
+  // UNGATED_WRITE_ALLOWLIST with a written reason.
 
   server.registerTool(
     "drive_extract_text",
@@ -2769,7 +2780,10 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           .optional()
           .describe("Optional language hint, e.g. 'en', 'ru'. Improves OCR accuracy."),
       },
-      annotations: { readOnlyHint: true },
+      // NO readOnlyHint — see the comment above: files.copy + a permanent
+      // files.delete run against the owner's Drive, even though the user's own
+      // file is untouched.
+      annotations: { destructiveHint: false },
     },
     guard(async ({ account, fileIds, ocrLanguage }) => {
       const g = clients.resolve(account);
