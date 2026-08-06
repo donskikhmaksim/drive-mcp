@@ -429,6 +429,67 @@ const GOOGLE_DOC_MIME = "application/vnd.google-apps.document";
 /** Raw Drive upload endpoint (resumable sessions bypass the googleapis client). */
 const UPLOAD_ENDPOINT = "https://www.googleapis.com/upload/drive/v3/files";
 
+/** Path of the upload endpoint above ("/upload/drive/v3/files"), DERIVED from
+ * the constant so the allowlist below can never drift from the real endpoint. */
+const UPLOAD_PATH_PREFIX = new URL(UPLOAD_ENDPOINT).pathname;
+
+/** Hard timeout for the raw (non-googleapis) upload/status requests, ms.
+ * limits-audit.md §10: an outgoing request without a timeout hangs a worker. */
+const UPLOAD_FETCH_TIMEOUT_MS = 30_000;
+
+/**
+ * Strict allowlist check for a resumable-session URI that arrived as a TOOL
+ * ARGUMENT (`drive_confirm_upload`'s `uploadUrl`).
+ *
+ * Why an allowlist and not the generic "block private IPs" SSRF filter
+ * (security-checklist.md §2): this server reads the owner's files, i.e. it
+ * routinely processes text written by OTHER people, which can carry
+ * instructions aimed at the model ("check this upload: https://…"). The model
+ * then hands that URL here and the server would PUT to it with its own
+ * network position — inside Railway's perimeter, next to cloud metadata
+ * (169.254.169.254) and to localhost ports of the container. The response body
+ * used to come back inside the tool result, so it was not blind SSRF but full
+ * read. A resumable session URI can only ever live on Google's upload host, so
+ * the narrow allowlist is both stronger and simpler than a private-range
+ * blocklist (which DNS rebinding and redirects routinely walk around).
+ *
+ * Every check is done on a PARSED `URL` — never on substrings: `.includes(
+ * "googleapis.com")` accepts `https://evil.example.com/googleapis.com/x`,
+ * `https://googleapis.com.evil.com/x` and `https://evil-googleapis.com/x`.
+ *
+ * Throws (with a Russian, human-readable reason) instead of returning a flag,
+ * so a caller cannot forget to check the result.
+ */
+export function assertGoogleUploadUrl(raw: string): URL {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error("адрес сессии загрузки не является валидным URL");
+  }
+  if (u.protocol !== "https:") {
+    throw new Error(`разрешён только https, получено «${u.protocol.replace(/:$/, "")}»`);
+  }
+  if (u.username !== "" || u.password !== "") {
+    throw new Error("адрес содержит логин/пароль (user:pass@) — такие адреса не принимаются");
+  }
+  if (u.port !== "" && u.port !== "443") {
+    throw new Error(`разрешён только порт 443, получен ${u.port}`);
+  }
+  // hostname: lower-case + drop a single trailing dot ("www.googleapis.com."
+  // is the same host for DNS but a different string).
+  const host = u.hostname.toLowerCase().replace(/\.$/, "");
+  const hostAllowed =
+    host === "googleapis.com" || host === "www.googleapis.com" || host.endsWith(".googleapis.com");
+  if (!hostAllowed) {
+    throw new Error(`хост «${host}» не входит в список разрешённых (только *.googleapis.com)`);
+  }
+  if (u.pathname !== UPLOAD_PATH_PREFIX && !u.pathname.startsWith(`${UPLOAD_PATH_PREFIX}/`)) {
+    throw new Error(`путь «${u.pathname}» не является upload-эндпоинтом Drive (${UPLOAD_PATH_PREFIX})`);
+  }
+  return u;
+}
+
 /** Metadata Google echoes back when a resumable upload finalises. */
 const UPLOAD_FIELDS = "id,name,mimeType,size,webViewLink";
 
@@ -444,6 +505,19 @@ async function errorBody(res: Response): Promise<string> {
     return "<unreadable body>";
   }
   return text.length > 500 ? `${text.slice(0, 500)}… (truncated)` : text;
+}
+
+/**
+ * Классифицированное пояснение к HTTP-коду от Google — БЕЗ тела ответа.
+ * Нужно там, где адрес запроса пришёл аргументом инструмента: тело такого
+ * ответа наружу не пересказывается вообще (security-checklist.md §6).
+ */
+function explainUploadStatus(status: number): string {
+  if (status === 401 || status === 403) return "Нет доступа к этой сессии загрузки (истёк токен или чужая сессия).";
+  if (status === 429) return "Слишком много запросов — повторите позже.";
+  if (status >= 500) return "Временная ошибка на стороне Google — повторите позже.";
+  if (status >= 400) return "Запрос отклонён. Проверьте, что сессия создана drive_create_upload_session и ещё жива.";
+  return "Неожиданный ответ для запроса статуса загрузки.";
 }
 
 /** Default export format for Google-native files when none is given. */
@@ -2047,18 +2121,70 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
     },
     guard(async ({ account, sessions }) => {
       const g = clients.resolve(account);
+
+      // ── SSRF-гейт (security-checklist.md §2) ────────────────────────────
+      // `uploadUrl` — аргумент, пришедший от модели, а модель читает файлы
+      // владельца (то есть текст, написанный посторонними). Проверяем ВЕСЬ
+      // батч ДО первого сетевого вызова и при любом отклонённом адресе не
+      // отправляем НИ ОДНОГО запроса (fail-closed): иначе валидный первый
+      // элемент батча уже унёс бы сервер во внутреннюю сеть.
+      const checked = sessions.map((s) => {
+        try {
+          assertGoogleUploadUrl(s.uploadUrl);
+          return { uploadUrl: s.uploadUrl, reason: null as string | null };
+        } catch (e: unknown) {
+          return { uploadUrl: s.uploadUrl, reason: e instanceof Error ? e.message : String(e) };
+        }
+      });
+      const rejected = checked.filter((c) => c.reason);
+      if (rejected.length) {
+        return ok({
+          summary:
+            `🛑 Адрес сессии загрузки не прошёл проверку — ни один запрос не отправлен ` +
+            `(${rejected.length} из ${sessions.length})`,
+          results: checked.map((c) => ({
+            uploadUrl: c.uploadUrl,
+            error:
+              c.reason ??
+              "не проверялся: в этом же вызове есть отклонённый адрес, поэтому весь вызов отменён целиком",
+          })),
+          note:
+            "Ссылка на сессию загрузки должна быть та, которую вернул drive_create_upload_session " +
+            "(https://www.googleapis.com/upload/drive/v3/files…). Сервер не ходит по произвольным адресам.",
+        });
+      }
+
       const results = await Promise.all(
         sessions.map(async ({ uploadUrl, sizeBytes }) => {
           try {
             // A zero-length PUT with "bytes */<total>" asks Google for the current status;
             // the session URI itself carries the upload_id, so no Authorization is needed.
+            // redirect: "manual" — редирект это штатный обход SSRF-фильтра
+            // (разрешённый хост отвечает 302 на 169.254.169.254), поэтому за
+            // Location НИКОГДА не идём (см. проверку сразу после fetch).
             const res = await fetch(uploadUrl, {
               method: "PUT",
               headers: {
                 "Content-Range": `bytes */${sizeBytes ?? "*"}`,
                 "Content-Length": "0",
               },
+              redirect: "manual",
+              signal: AbortSignal.timeout(UPLOAD_FETCH_TIMEOUT_MS),
             });
+
+            // ВАЖНО: штатный ответ «докачивай дальше» — это 308 с заголовком
+            // `Range` и БЕЗ `Location`. Поэтому редирект отличаем именно по
+            // наличию `Location`, а не по коду статуса (308 сам по себе —
+            // нормальный ответ resumable-протокола, см. ветку ниже).
+            const location = res.headers.get("location");
+            if (location) {
+              return {
+                uploadUrl,
+                error:
+                  `Google ответил перенаправлением (HTTP ${res.status}) — сервер за редиректом не идёт ` +
+                  "(защита от SSRF). Создайте сессию загрузки заново.",
+              };
+            }
 
             if (res.status === 200 || res.status === 201) {
               // The session was created with `fields=`, so the finalising response already
@@ -2134,7 +2260,15 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
               };
             }
 
-            return { uploadUrl, error: `Google returned ${res.status}: ${await errorBody(res)}` };
+            // Тело ответа СЮДА НЕ ПОПАДАЕТ (в отличие от остальных мест, где
+            // errorBody применяется к ответам по захардкоженным адресам):
+            // адрес здесь пришёл аргументом, и пересказ тела наружу — готовый
+            // канал эксфильтрации (security-checklist.md §2/§6). Наружу идёт
+            // только код статуса + классифицированное пояснение по-русски.
+            return {
+              uploadUrl,
+              error: `Google вернул HTTP ${res.status}. ${explainUploadStatus(res.status)}`,
+            };
           } catch (e: unknown) {
             return { uploadUrl, error: e instanceof Error ? e.message : String(e) };
           }

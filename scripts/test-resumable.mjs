@@ -7,6 +7,11 @@
  * how each Drive response (200/201, 308, 404/410, network error) is reported
  * back to the model. Needs no credentials and no network.
  *
+ * NOTE: every `uploadUrl` below is a REAL-shaped Google resumable session URI
+ * (https://www.googleapis.com/upload/drive/v3/files?…) because
+ * drive_confirm_upload now refuses anything outside that allowlist before it
+ * makes a request at all — see scripts/test-confirm-upload-ssrf.mjs.
+ *
  * drive_create_upload_session is consent-gated (mcp-development-standard/
  * references/gate.md) — every scenario below goes through a plan call (no
  * manifest_id/user_reply) followed by an execute call (manifest_id +
@@ -221,7 +226,7 @@ check("plan response is a plan, not a result", planOnlyResp.content[0].text.incl
 console.log("\n[7] confirm — upload still in progress");
 calls.length = 0;
 responder = () => res({ status: 308, headers: { range: "bytes=0-524287" } });
-out = await call("drive_confirm_upload", { sessions: [{ uploadUrl: "https://upload/S1", sizeBytes: 1000000 }] });
+out = await call("drive_confirm_upload", { sessions: [{ uploadUrl: "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=S1", sizeBytes: 1000000 }] });
 req = calls[0];
 check("status query is a PUT", req.method === "PUT", req.method);
 check("Content-Range asks for status", req.headers["Content-Range"] === "bytes */1000000", req.headers["Content-Range"]);
@@ -234,7 +239,7 @@ check("nextOffset matches", out.results[0].nextOffset === 524288, String(out.res
 console.log("\n[8] confirm — nothing received yet");
 calls.length = 0;
 responder = () => res({ status: 308 });
-out = await call("drive_confirm_upload", { sessions: [{ uploadUrl: "https://upload/S2" }] });
+out = await call("drive_confirm_upload", { sessions: [{ uploadUrl: "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=S2" }] });
 check("unknown size → bytes */*", calls[0].headers["Content-Range"] === "bytes */*", calls[0].headers["Content-Range"]);
 check("bytesReceived = 0 without a Range header", out.results[0].bytesReceived === 0, String(out.results[0].bytesReceived));
 
@@ -249,7 +254,7 @@ filesGet = async ({ fileId }) => ({
     webViewLink: "https://drive/NEWID",
   },
 });
-out = await call("drive_confirm_upload", { sessions: [{ uploadUrl: "https://upload/S3" }] });
+out = await call("drive_confirm_upload", { sessions: [{ uploadUrl: "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=S3" }] });
 check("status = completed", out.results[0].status === "completed", out.results[0].status);
 check("final fileId returned", out.results[0].fileId === "NEWID", String(out.results[0].fileId));
 check("link filled in from metadata", out.results[0].webViewLink === "https://drive/NEWID", String(out.results[0].webViewLink));
@@ -260,21 +265,21 @@ responder = () => res({ status: 201, body: JSON.stringify({ id: "NEWID2", name: 
 filesGet = async () => {
   throw new Error("rate limited");
 };
-out = await call("drive_confirm_upload", { sessions: [{ uploadUrl: "https://upload/S4" }] });
+out = await call("drive_confirm_upload", { sessions: [{ uploadUrl: "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=S4" }] });
 check("still reported as completed", out.results[0].status === "completed", out.results[0].status);
 check("fileId survives the failed lookup", out.results[0].fileId === "NEWID2", String(out.results[0].fileId));
 
 console.log("\n[11] confirm — session gone / unexpected status / network error");
 responder = () => res({ status: 404, body: "not found" });
-out = await call("drive_confirm_upload", { sessions: [{ uploadUrl: "https://upload/S5" }] });
+out = await call("drive_confirm_upload", { sessions: [{ uploadUrl: "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=S5" }] });
 check("404 → expired", out.results[0].status === "expired", out.results[0].status);
 
 responder = () => res({ status: 410, body: "gone" });
-out = await call("drive_confirm_upload", { sessions: [{ uploadUrl: "https://upload/S6" }] });
+out = await call("drive_confirm_upload", { sessions: [{ uploadUrl: "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=S6" }] });
 check("410 → expired", out.results[0].status === "expired", out.results[0].status);
 
 responder = () => res({ status: 500, body: "server error" });
-out = await call("drive_confirm_upload", { sessions: [{ uploadUrl: "https://upload/S7" }] });
+out = await call("drive_confirm_upload", { sessions: [{ uploadUrl: "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=S7" }] });
 check(
   "500 → plain error, no bogus status",
   out.results[0].status === undefined && /500/.test(out.results[0].error ?? ""),
@@ -285,7 +290,7 @@ responder = () => {
   throw new Error("socket hang up");
 };
 out = await call("drive_confirm_upload", {
-  sessions: [{ uploadUrl: "https://upload/A" }, { uploadUrl: "https://upload/B" }],
+  sessions: [{ uploadUrl: "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=A" }, { uploadUrl: "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=B" }],
 });
 check(
   "network failure contained per session, tool still returns",
