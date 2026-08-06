@@ -12,10 +12,13 @@ import type { GoogleClients } from "../google.js";
 import { documentToPlainText } from "./docs.js";
 import {
   issueDownloadLink,
+  resolveDownloadLink,
   downloadsAvailable,
   DEFAULT_TTL_MINUTES,
   MAX_TTL_MINUTES,
 } from "../downloads.js";
+import { rememberUploadSession, resolveUploadSession } from "../uploadSessions.js";
+import { safeGoogleFetch, assertAllowedGoogleUrl, BlockedUrlError } from "../safeFetch.js";
 import {
   requireConsent,
   sha256,
@@ -972,6 +975,9 @@ async function executeUploadSessionCore(
     name: string | null;
     fileId: string | null;
     mode?: "create" | "replace";
+    /** Непрозрачный идентификатор сессии — ИМЕННО ЕГО ждёт обратно
+     * `drive_confirm_upload`. Сам адрес обратно не принимается (SSRF). */
+    sessionId?: string;
     uploadUrl?: string;
     mimeType?: string;
     sizeBytes?: number | null;
@@ -1001,7 +1007,11 @@ async function executeUploadSessionCore(
       if (name) metadata.name = name;
       if (!fileId && parentId) metadata.parents = [parentId];
 
-      const res = await fetch(url, {
+      // safeGoogleFetch, а не голый fetch: здесь уходит Bearer-токен аккаунта,
+      // и молча последовать за перенаправлением на чужой хост означало бы
+      // отдать этот токен туда. Сам адрес собран из константы UPLOAD_ENDPOINT,
+      // но проверка всё равно единая для всех исходящих запросов к Google.
+      const res = await safeGoogleFetch(url, {
         method: fileId ? "PATCH" : "POST",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -1022,6 +1032,27 @@ async function executeUploadSessionCore(
           error: "Google did not return a resumable session URI (no Location header).",
         };
       }
+      // Даже адрес, пришедший от самого Google, проверяем: дальше по нему
+      // будет ходить сервер (drive_confirm_upload), и хранить непроверенный
+      // адрес — значит отложить проблему, а не решить её.
+      try {
+        assertAllowedGoogleUrl(uploadUrl);
+      } catch (e) {
+        return {
+          name: label,
+          fileId: fileId ?? null,
+          error: `Google вернул недопустимый адрес сессии загрузки (${e instanceof Error ? e.message : String(e)}).`,
+        };
+      }
+      const remembered = await rememberUploadSession({
+        account: payload.account,
+        uploadUrl,
+        mode: fileId ? "replace" : "create",
+        fileId: fileId ?? null,
+        name: name ?? null,
+        mimeType: resolvedMime,
+        sizeBytes: sizeBytes ?? null,
+      });
       const total = sizeBytes ? String(sizeBytes) : "*";
       const lastByte = sizeBytes ? String(sizeBytes - 1) : "<end>";
       const howTo =
@@ -1031,11 +1062,13 @@ async function executeUploadSessionCore(
           ? " (a single PUT of the whole file is fine). "
           : " — the total size is unknown, so keep sending '*' as the total and put the " +
             "real total in the Content-Range of the FINAL chunk to finalise the upload. ") +
-        "Then call drive_confirm_upload with the same uploadUrl.";
+        "Then call drive_confirm_upload with the `sessionId` below (NOT the uploadUrl — the " +
+        "server keeps the address itself and does not accept one from a tool argument).";
       return {
         name: name ?? null,
         fileId: fileId ?? null,
         mode: fileId ? ("replace" as const) : ("create" as const),
+        sessionId: remembered.sessionId,
         uploadUrl,
         mimeType: resolvedMime,
         sizeBytes: sizeBytes ?? null,
@@ -1367,6 +1400,178 @@ registerAutoExecutor("drive_unshare", {
     const p = payload as UnsharePayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeUnshareCore(g, p, auditId, ctx.consentStore);
+    return extractText(result);
+  },
+});
+
+// ── drive_get_download_url ───────────────────────────────────────────────
+// ГЕЙТОВАН (задача #112). Раньше был помечен `readOnlyHint` и вызывался
+// моделью без единой кнопки. «Только чтение» здесь — иллюзия: инструмент не
+// читает файл, он РАЗДАЁТ К НЕМУ ДОСТУП. Выданная ссылка сама является
+// доступом: кто её получил — скачает файл без всякой авторизации, живёт она
+// около суток и НЕ ОТЗЫВАЕТСЯ. Утечка такой ссылки в лог, в чат или в чужой
+// контекст равна утечке самого файла — то есть по последствиям это выдача
+// прав, как `drive_share`, а не чтение.
+//
+// Binding РЕАЛЬНЫЙ: перечитывает живые метаданные каждого файла (имя, тип,
+// размер, корзина) — если между планом и подтверждением файл подменили или
+// удалили, дрейф ловится и ссылка не выдаётся.
+
+export interface DownloadUrlItem {
+  fileId: string;
+  exportMimeType?: string;
+}
+export interface DownloadUrlPayload {
+  account: string;
+  ttlMinutes: number;
+  files: DownloadUrlItem[];
+}
+
+async function downloadUrlBindingSnapshot(g: GoogleClients, files: DownloadUrlItem[]) {
+  return mapWithLimit(files, async (f) => {
+    const meta = await liveFileMeta(g, f.fileId);
+    return {
+      fileId: f.fileId,
+      exportMimeType: f.exportMimeType ?? null,
+      name: meta?.name ?? null,
+      mimeType: meta?.mimeType ?? null,
+      size: meta?.size ?? null,
+      trashed: meta?.trashed ?? null,
+      md5Checksum: meta?.md5Checksum ?? null,
+    };
+  });
+}
+
+async function downloadUrlRehash(g: GoogleClients, addressing: ConsentAddressing): Promise<string> {
+  const a = addressing as DownloadUrlPayload;
+  const snapshot = await downloadUrlBindingSnapshot(g, a.files);
+  return sha256({ account: a.account, ttlMinutes: a.ttlMinutes, files: snapshot });
+}
+
+/** Человеческая формулировка того, ЧТО именно подтверждает владелец. Вынесена
+ * отдельной константой, потому что это и есть текст, который человек читает
+ * над кнопкой «✅ Подтвердить» в Telegram: невнятный текст обесценивает всю
+ * кнопку — подтверждают то, что поняли. */
+export function downloadUrlConsentWarning(ttlMinutes: number, expiresAtMs: number): string {
+  return (
+    "⚠️ **Ссылка — это и есть доступ к файлу.** Любой, у кого она окажется (переслали, попала в " +
+    "лог, в чужой контекст), скачает файл БЕЗ входа в Google-аккаунт и без каких-либо прав. " +
+    `**Отозвать выданную ссылку нельзя** — она работает, пока не истечёт срок: ${ttlMinutes} мин ` +
+    `(примерно до ${formatLaTime(expiresAtMs)} PT).`
+  );
+}
+
+/** Хвост превью: буквально расшифровывает, что делает кнопка подтверждения. */
+export function downloadUrlConsentButtonLine(count: number, ttlMinutes: number): string {
+  return (
+    `_Кнопка «✅ Подтвердить» означает: ВЫДАТЬ ${count === 1 ? "ссылку" : `${count} ссылки`}, по ` +
+    `${count === 1 ? "которой" : "которым"} файл скачает любой, у кого она есть; отозвать нельзя; ` +
+    `живёт ~${ttlMinutes} мин._`
+  );
+}
+
+async function executeGetDownloadUrlCore(
+  g: GoogleClients,
+  payload: DownloadUrlPayload,
+  auditId: string,
+  consentStore: ConsentStore,
+): Promise<CallToolResult> {
+  interface LinkResult {
+    fileId: string;
+    name?: string;
+    mimeType?: string;
+    size?: string | null;
+    downloadUrl?: string;
+    expiresAt?: string;
+    error?: string;
+  }
+  const results = await mapWithLimit<DownloadUrlItem, LinkResult>(payload.files, async ({ fileId, exportMimeType }) => {
+    try {
+      const meta = await g.drive.files.get({
+        fileId,
+        fields: "id,name,mimeType,size",
+        supportsAllDrives: true,
+      });
+      const mime = meta.data.mimeType ?? "application/octet-stream";
+      const isNative = mime.startsWith("application/vnd.google-apps.");
+      const exportMime = isNative ? exportMimeType ?? defaultExportMime(mime) : undefined;
+      const name = exportMime
+        ? withExportExtension(meta.data.name ?? "file", exportMime)
+        : meta.data.name ?? "file";
+      const { url, expiresAt } = await issueDownloadLink(
+        {
+          account: payload.account,
+          fileId,
+          exportMime,
+          name,
+          mimeType: exportMime ?? mime,
+          size: meta.data.size ? Number(meta.data.size) : undefined,
+        },
+        payload.ttlMinutes,
+      );
+      return {
+        fileId,
+        name,
+        mimeType: exportMime ?? mime,
+        // Exports are generated on the fly, so their size is unknown up front.
+        size: exportMime ? null : meta.data.size ?? null,
+        downloadUrl: url,
+        expiresAt,
+      };
+    } catch (e: unknown) {
+      return { fileId, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+  return buildMutationResult({
+    results,
+    total: payload.files.length,
+    verb: "Выдано ссылок:",
+    summaryIcon: "🔗",
+    // Post-verify не «доверяем своему же ответу»: перечитываем выданный токен
+    // из хранилища ссылок и проверяем, что он ведёт ИМЕННО к этому файлу.
+    verify: (r) => postVerifyDownloadLink(r.downloadUrl ?? null, r.fileId, r.name ?? r.fileId),
+    reportTitle: "Независимая проверка выданных ссылок",
+    reportSubtitle: "выданная ссылка ⇄ запись в хранилище ссылок сервера",
+    consentStore,
+    auditId,
+  });
+}
+
+/** Post-verify для выданной ссылки: токен реально сохранён и указывает на
+ * тот же файл (а не «сервер сказал, что выдал»). */
+export async function postVerifyDownloadLink(
+  downloadUrl: string | null,
+  fileId: string,
+  label: string,
+): Promise<VerifyLine> {
+  const lbl = safeText(label) || "(файл)";
+  if (!downloadUrl) {
+    return { outcome: "warn", line: `- ⚠️ **«${lbl}»** — ссылка не выдана` };
+  }
+  const token = downloadUrl.split("/dl/")[1] ?? "";
+  const target = await resolveDownloadLink(token);
+  if (!target) {
+    return { outcome: "mismatch", line: `- ❌ **«${lbl}»** — выданной ссылки нет в хранилище сервера` };
+  }
+  if (target.fileId !== fileId) {
+    return { outcome: "mismatch", line: `- ❌ **«${lbl}»** — ссылка ведёт к другому файлу (${safeText(target.fileId, 40)})` };
+  }
+  return {
+    outcome: "ok",
+    line: `- ✅ **«${lbl}»** — ссылка действует до ${formatLaTime(target.expiresAt)} PT и ведёт к этому файлу; отозвать её нельзя`,
+  };
+}
+
+registerAutoExecutor("drive_get_download_url", {
+  rehash: (addressing, ctx: AutoExecutorCtx) => {
+    const p = addressing as DownloadUrlPayload;
+    const g = ctx.clients.resolve(p.account);
+    return downloadUrlRehash(g, addressing);
+  },
+  execute: async (payload, auditId, ctx: AutoExecutorCtx) => {
+    const p = payload as DownloadUrlPayload;
+    const g = ctx.clients.resolve(p.account);
+    const result = await executeGetDownloadUrlCore(g, p, auditId, ctx.consentStore);
     return extractText(result);
   },
 });
@@ -2013,6 +2218,17 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
   // what already happened. The actual write is gated at session-creation
   // time (drive_create_upload_session above), which is the last point this
   // server is in control before bytes start moving client→Google directly.
+  //
+  // ЧТО ЗДЕСЬ ИСПРАВЛЕНО (задача #112). Раньше этот инструмент принимал
+  // `uploadUrl` — АДРЕС, ПРИШЕДШИЙ В АРГУМЕНТЕ, — и шёл по нему без единой
+  // проверки. Это давало подделку запроса со стороны сервера (SSRF): модель,
+  // которой скормили нужный текст, заставляла сервер постучаться во
+  // внутреннюю сеть (метаданные облака, приватные диапазоны, localhost) и
+  // вернуть ответ наружу. Теперь адрес не принимается ВООБЩЕ: сервер сам
+  // выдал его при создании сессии, сам и хранит (uploadSessions.ts), а
+  // наружу отдаёт только непрозрачный `sessionId`. Плюс второй рубеж —
+  // safeGoogleFetch (allowlist хостов Google + запрет приватных адресов на
+  // уровне реального соединения + проверка каждого перенаправления).
 
   server.registerTool(
     "drive_confirm_upload",
@@ -2020,18 +2236,23 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       title: "Check / confirm a resumable upload",
       description:
         "Query the status of one or more resumable upload sessions created by " +
-        "drive_create_upload_session. If the upload finished, returns the final fileId together " +
-        "with the file name, mimeType and webViewLink. If it is still incomplete, reports how many " +
-        "bytes Google has already accepted so the client can resume from that offset. A session " +
-        "that Google no longer knows about (404/410 Gone) comes back as status='expired'.",
+        "drive_create_upload_session. Pass the `sessionId` each session returned — the upload " +
+        "address itself is kept server-side and is NOT accepted as an argument. If the upload " +
+        "finished, returns the final fileId together with the file name, mimeType and " +
+        "webViewLink. If it is still incomplete, reports how many bytes Google has already " +
+        "accepted so the client can resume from that offset. A session that Google no longer " +
+        "knows about (404/410 Gone) comes back as status='expired'.",
       inputSchema: {
         account,
         sessions: z
           .array(
             z.object({
-              uploadUrl: z
+              sessionId: z
                 .string()
-                .describe("The resumable session URI returned by drive_create_upload_session."),
+                .describe(
+                  "The opaque `sessionId` returned by drive_create_upload_session. NOT a URL: " +
+                    "the server looks the real upload address up in its own store.",
+                ),
               sizeBytes: z
                 .number()
                 .int()
@@ -2046,16 +2267,27 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       annotations: { readOnlyHint: true },
     },
     guard(async ({ account, sessions }) => {
-      const g = clients.resolve(account);
       const results = await Promise.all(
-        sessions.map(async ({ uploadUrl, sizeBytes }) => {
+        sessions.map(async ({ sessionId, sizeBytes }) => {
+          const session = await resolveUploadSession(sessionId);
+          if (!session) {
+            return {
+              sessionId,
+              error:
+                "Сессия загрузки с таким `sessionId` не найдена (истекла или её создавал не этот сервер). " +
+                "Создайте новую через drive_create_upload_session.",
+            };
+          }
+          // Аккаунт берём ИЗ ЗАПИСИ СЕССИИ, а не из аргумента: сессия
+          // принадлежит тому аккаунту, под которым её создавали.
+          const g = clients.resolve(session.account ?? account);
           try {
             // A zero-length PUT with "bytes */<total>" asks Google for the current status;
             // the session URI itself carries the upload_id, so no Authorization is needed.
-            const res = await fetch(uploadUrl, {
+            const res = await safeGoogleFetch(session.uploadUrl, {
               method: "PUT",
               headers: {
-                "Content-Range": `bytes */${sizeBytes ?? "*"}`,
+                "Content-Range": `bytes */${sizeBytes ?? session.sizeBytes ?? "*"}`,
                 "Content-Length": "0",
               },
             });
@@ -2099,7 +2331,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
                 }
               }
               return {
-                uploadUrl,
+                sessionId,
                 status: "completed" as const,
                 fileId,
                 name,
@@ -2115,7 +2347,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
               const end = range ? Number(range.split("-")[1]) : NaN;
               const bytesReceived = Number.isFinite(end) ? end + 1 : 0;
               return {
-                uploadUrl,
+                sessionId,
                 status: "incomplete" as const,
                 bytesReceived,
                 nextOffset: bytesReceived,
@@ -2127,16 +2359,16 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
 
             if (res.status === 404 || res.status === 410) {
               return {
-                uploadUrl,
+                sessionId,
                 status: "expired" as const,
                 error:
                   "Upload session is gone (expired or already finalised). Create a new session.",
               };
             }
 
-            return { uploadUrl, error: `Google returned ${res.status}: ${await errorBody(res)}` };
+            return { sessionId, error: `Google returned ${res.status}: ${await errorBody(res)}` };
           } catch (e: unknown) {
-            return { uploadUrl, error: e instanceof Error ? e.message : String(e) };
+            return { sessionId, error: e instanceof Error ? e.message : String(e) };
           }
         }),
       );
@@ -2339,16 +2571,21 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
   server.registerTool(
     "drive_get_download_url",
     {
-      title: "Get a temporary download link",
+      title: "Выдать ссылку-доступ на скачивание файла (кто угодно с ссылкой скачает)",
       description:
-        "Return a temporary download link per file so the client (phone, browser, script) can fetch the bytes " +
+        "Hand out a temporary download link per file so the client (phone, browser, script) can fetch the bytes " +
         "directly, instead of drive_download_file inlining them into this conversation. Use it for anything large " +
         "or binary, or whenever the user wants to keep the file rather than read its content here. " +
         "Google-native files (Docs/Sheets/Slides) are exported on the fly — default doc→text, sheet→csv, else pdf; " +
         "override with exportMimeType. " +
-        "The link IS the credential: anyone holding it can fetch that one file until it expires " +
-        `(default ${DEFAULT_TTL_MINUTES} minutes, max ${MAX_TTL_MINUTES / 60} hours), so pass it only to the person who asked. ` +
-        "It grants access to that single file and nothing else.",
+        "THIS IS NOT A READ: the link IS the credential. Anyone holding it downloads that file with NO sign-in " +
+        `and no permissions, and the link CANNOT be revoked — it works until it expires (default ${DEFAULT_TTL_MINUTES} ` +
+        `minutes, max ${MAX_TTL_MINUTES / 60} hours). Leaking it into a log, a chat, or another context is equivalent ` +
+        "to leaking the file itself. That is why it is a two-mode consent-gated tool " +
+        "(mcp-development-standard/references/gate.md): call WITHOUT `manifest_id`/`user_reply` (with `files`) to " +
+        "build a plan and return a preview — NO link is issued yet. Show the preview to the user verbatim and wait " +
+        "for their reply. Call again with the returned `manifest_id` and the user's VERBATIM `user_reply` to " +
+        "actually issue the link(s).",
       inputSchema: {
         account,
         files: z
@@ -2361,8 +2598,11 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
                 .describe("Override export format for Google-native files, e.g. 'application/pdf'."),
             }),
           )
-          .min(1)
-          .describe("Array of files to build links for."),
+          .optional()
+          .describe(
+            "Required to build a plan (first call, no manifest_id/user_reply). Ignored on the execute call — " +
+              "the approved batch is read back from the manifest.",
+          ),
         ttlMinutes: z
           .number()
           .int()
@@ -2370,10 +2610,15 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           .max(MAX_TTL_MINUTES)
           .optional()
           .describe(`How long each link stays valid. Default ${DEFAULT_TTL_MINUTES} minutes.`),
+        manifest_id: z
+          .string()
+          .optional()
+          .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
+        user_reply: z.string().optional().describe(USER_REPLY_DOC),
       },
-      annotations: { readOnlyHint: true },
+      annotations: { destructiveHint: false },
     },
-    guard(async ({ account, files, ttlMinutes }) => {
+    guard(async ({ account, files, ttlMinutes, manifest_id, user_reply }) => {
       if (!downloadsAvailable()) {
         return fail(
           "Download links are unavailable: this server does not know its own public URL. " +
@@ -2381,51 +2626,57 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
             "drive_download_file still works for small files.",
         );
       }
+      const { consentStore, consentCfg, tg } = ctx;
+      if (!consentStore) {
+        return fail(
+          "Выдача ссылок недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
+            "провести это действие через гейт подтверждения — обратитесь к администратору сервера.",
+        );
+      }
       const g = clients.resolve(account);
-      const results = await Promise.all(
-        files.map(async ({ fileId, exportMimeType }) => {
-          try {
-            const meta = await g.drive.files.get({
-              fileId,
-              fields: "id,name,mimeType,size",
-              supportsAllDrives: true,
-            });
-            const mime = meta.data.mimeType ?? "application/octet-stream";
-            const isNative = mime.startsWith("application/vnd.google-apps.");
-            const exportMime = isNative ? exportMimeType ?? defaultExportMime(mime) : undefined;
-            const name = exportMime
-              ? withExportExtension(meta.data.name ?? "file", exportMime)
-              : meta.data.name ?? "file";
-            const { url, expiresAt } = await issueDownloadLink(
-              {
-                account: account ?? clients.defaultName,
-                fileId,
-                exportMime,
-                name,
-                mimeType: exportMime ?? mime,
-                size: meta.data.size ? Number(meta.data.size) : undefined,
-              },
-              ttlMinutes ?? DEFAULT_TTL_MINUTES,
-            );
-            return {
-              fileId,
-              name,
-              mimeType: exportMime ?? mime,
-              // Exports are generated on the fly, so their size is unknown up front.
-              size: exportMime ? null : meta.data.size ?? null,
-              downloadUrl: url,
-              expiresAt,
-            };
-          } catch (e: unknown) {
-            return { fileId, error: e instanceof Error ? e.message : String(e) };
+      const accountName = account ?? clients.defaultName;
+      const ttl = ttlMinutes ?? DEFAULT_TTL_MINUTES;
+
+      const decision = await requireConsent<DownloadUrlPayload>({
+        tool: "drive_get_download_url",
+        accountLabel: accountName,
+        manifestId: manifest_id,
+        userReply: user_reply,
+        store: consentStore,
+        cfg: consentCfg,
+        tg,
+        plan: async () => {
+          if (!files || !files.length) {
+            throw new Error("Нужен непустой `files`, чтобы построить план выдачи ссылок.");
           }
-        }),
-      );
-      return ok({
-        summary: `🔗 Built ${files.length} download link(s)`,
-        results,
-        note: "Each link works without any further sign-in until it expires — treat it as a password for that one file.",
+          const snapshot = await downloadUrlBindingSnapshot(g, files);
+          const payload: DownloadUrlPayload = { account: accountName, ttlMinutes: ttl, files };
+          const lines = snapshot.map((s) => {
+            const native = (s.mimeType ?? "").startsWith("application/vnd.google-apps.");
+            const exported = native ? s.exportMimeType ?? defaultExportMime(s.mimeType ?? "") : null;
+            const head = `- **«${safeText(s.name ?? s.fileId, 60)}»**`;
+            if (s.name === null) return `${head} — не удалось прочитать файл ${safeText(s.fileId, 40)}`;
+            const what = exported
+              ? `будет выгружен как ${safeText(exported, 40)}`
+              : `${safeText(s.mimeType ?? "", 40)}, ${s.size ?? "?"} байт`;
+            return `${head} (${what})${s.trashed ? " — ⚠️ файл в корзине" : ""}`;
+          });
+          const preview =
+            `### 📤 План: Выдать ссылки на скачивание — ${files.length}\n\n` +
+            `${downloadUrlConsentWarning(ttl, Date.now() + ttl * 60_000)}\n\n` +
+            `${lines.join("\n")}\n\n` +
+            `${downloadUrlConsentButtonLine(files.length, ttl)}`;
+          const objectHash = sha256({ account: accountName, ttlMinutes: ttl, files: snapshot });
+          return { payload, objectHash, preview, batchSize: files.length };
+        },
+        rehash: (addressing) => downloadUrlRehash(g, addressing),
       });
+
+      if (decision.kind === "planned") return ok(decision.preview);
+      if (decision.kind === "refused") return ok(decision.result);
+
+      const { payload, auditId } = decision;
+      return executeGetDownloadUrlCore(g, payload, auditId, consentStore);
     }),
   );
 

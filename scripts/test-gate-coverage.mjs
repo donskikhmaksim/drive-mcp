@@ -36,6 +36,7 @@ import { registerDriveTools } from "../dist/tools/drive.js";
 import { registerDocsTools } from "../dist/tools/docs.js";
 import { registerSkillVersionTools } from "../dist/tools/skill_version.js";
 import { registerAccountTools } from "../dist/accounts.js";
+import { initDownloads } from "../dist/downloads.js";
 
 let failures = 0;
 const check = (label, cond, extra = "") => {
@@ -80,6 +81,16 @@ const GATED_TOOLS = {
   drive_create_upload_session: {
     args: { files: [{ name: "video.mp4", sizeBytes: 1000 }] },
     counterKey: "fetchCalls",
+    destructive: false,
+  },
+  // Выдача ссылки — НЕ чтение (задача #112): ссылка сама является доступом,
+  // отозвать её нельзя. Мутирующих вызовов Drive у этого тула нет, поэтому
+  // «ничего не произошло» проверяется иначе — в ответе плана не должно быть
+  // ни одной выданной ссылки (`/dl/<token>`).
+  drive_get_download_url: {
+    args: { files: [{ fileId: "F1" }] },
+    counterKey: "filesCreate",
+    forbiddenInPlan: /\/dl\//,
     destructive: false,
   },
   drive_overwrite_file: {
@@ -241,6 +252,9 @@ async function harness() {
     counters.fetchCalls++;
     return { ok: true, status: 200, headers: { get: () => "https://upload/SESSION" }, text: async () => "", json: async () => ({}) };
   };
+  // Без известного публичного адреса drive_get_download_url отказывает ДО
+  // гейта («не знаю своего адреса»), и проверка гейта была бы холостой.
+  initDownloads("https://links.example");
   const consentStore = makeConsentStore();
   const consentCtx = { consentStore, consentCfg: CONSENT_CFG, auditStore: null };
   const server = new McpServer({ name: "gate-coverage", version: "0" });
@@ -298,11 +312,14 @@ for (const [name, spec] of Object.entries(GATED_TOOLS)) {
   const body = text(resp);
   check(`${name} plan call: mutation counter (${spec.counterKey}) unchanged`, counters[spec.counterKey] === before, String(counters[spec.counterKey]));
   check(`${name} plan call: response is a plan, not a success/failure header`, body.includes("### 📤 План"), body.slice(0, 60));
+  if (spec.forbiddenInPlan) {
+    check(`${name} plan call: hands out nothing (${spec.forbiddenInPlan})`, !spec.forbiddenInPlan.test(body), body.slice(0, 200));
+  }
   check(`${name} plan call: no ✅/✏️/📁/❌ success-style header`, !/^[✅✏️📁❌♻️]/.test(body), body.slice(0, 10));
 }
 
 console.log("\n[5] read tools genuinely carry readOnlyHint (spot-check, not exhaustive)");
-for (const name of ["drive_search", "drive_get_metadata", "drive_download_file", "drive_get_download_url", "drive_get_permissions", "drive_extract_text", "drive_confirm_upload", "drive_consent_audit", "docs_list", "docs_read", "list_accounts"]) {
+for (const name of ["drive_search", "drive_get_metadata", "drive_download_file", "drive_get_permissions", "drive_extract_text", "drive_confirm_upload", "drive_consent_audit", "docs_list", "docs_read", "list_accounts"]) {
   const t = tools.find((x) => x.name === name);
   check(`${name} readOnlyHint: true`, t?.annotations?.readOnlyHint === true, JSON.stringify(t?.annotations));
 }
