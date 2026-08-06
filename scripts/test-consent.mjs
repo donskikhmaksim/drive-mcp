@@ -236,7 +236,10 @@ console.log("\n[8] ни да ни нет → 🛑, манифест жив");
   const id = planned.manifestId;
   clock.t += 3_000;
   const dec = await requireConsent({ tool: "drive_share", accountLabel: "personal", manifestId: id, userReply: "наверное как-нибудь потом", plan, rehash, store, cfg });
-  check("kind=refused (не понял)", dec.kind === "refused" && dec.result.includes("Не понял"), dec.result?.slice(0, 50));
+  // «наверное …» — класс `hedge` (неуверенность) после переноса строгого
+  // протокола; раньше это был общий `unknown` с заголовком «Не понял ответ».
+  // Разряд последствий тот же: план ЖИВ.
+  check("kind=refused (неуверенность)", dec.kind === "refused" && dec.result.includes("Неуверенный ответ"), dec.result?.slice(0, 50));
   check("манифест жив", store.manifests.get(id).status === "AWAITING_CONSENT");
 }
 
@@ -299,11 +302,17 @@ console.log("\n[13] classifyReply — словари RU+EN");
   const ctx = { manifestId: "mid", tool: "drive_share" };
   const aff = ["да", "ок", "окей", "давай", "подтверждаю", "отправляй", "го", "+", "yes", "confirm", "send it", "go ahead"];
   const neg = ["нет", "стоп", "отмена", "погоди", "не надо", "no", "cancel", "stop", "don't", "do not"];
-  const unk = ["наверное", "хм", "что там по срокам"];
+  // После переноса строгого протокола общий класс `unknown` разделён на
+  // `hedge` (неуверенность — «наверное») и `ambiguous` (всё остальное, что не
+  // является однозначным «да»). Разряд последствий у обоих одинаковый: план
+  // остаётся ЖИВЫМ. Полные наборы фраз — scripts/test-consent-strict.mjs.
+  const hedge = ["наверное"];
+  const amb = ["хм", "что там по срокам"];
   for (const s of aff) check(`aff: «${s}»`, classifyReply(s, ctx) === "affirmation", classifyReply(s, ctx));
   for (const s of neg) check(`neg: «${s}»`, classifyReply(s, ctx) === "negation", classifyReply(s, ctx));
-  for (const s of unk) check(`unk: «${s}»`, classifyReply(s, ctx) === "unknown", classifyReply(s, ctx));
-  check("пустая строка → unknown", classifyReply("   ", ctx) === "unknown");
+  for (const s of hedge) check(`hedge: «${s}»`, classifyReply(s, ctx) === "hedge", classifyReply(s, ctx));
+  for (const s of amb) check(`ambiguous: «${s}»`, classifyReply(s, ctx) === "ambiguous", classifyReply(s, ctx));
+  check("пустая строка → empty", classifyReply("   ", ctx) === "empty", classifyReply("   ", ctx));
 }
 
 // ── 14. регрессии приёмки: negation-конструкция vs ложная инвалидация ───────
@@ -318,19 +327,26 @@ console.log("\n[14] дыры приёмки №1/№2: «not sure» ≠ да; «
   // «not sure»/«not ok» — конструкция «частица+affirmation» → отрицание.
   check("«not sure» = negation", classifyReply("not sure", ctx) === "negation");
   check("«not ok» = negation", classifyReply("not ok", ctx) === "negation");
-  // «not really» — частица без утвердительной головы → unknown (не да и не инвалидация).
-  check("«not really» = unknown", classifyReply("not really", ctx) === "unknown");
+  // «not really» — частица без утвердительной головы → НЕ отрицание и НЕ «да».
+  check("«not really» = ambiguous", classifyReply("not really", ctx) === "ambiguous", classifyReply("not really", ctx));
 
   // «не <affirmation>» → отрицание.
   check("«не отправляй» = negation", classifyReply("не отправляй", ctx) === "negation");
   check("«не надо» = negation", classifyReply("не надо", ctx) === "negation");
 
-  // №2 — ложная инвалидация: «не» перед НЕ-головой = согласие, а не отрицание.
-  check("«отправляй, не тяни» = affirmation", classifyReply("отправляй, не тяни", ctx) === "affirmation");
-  // «чего ждёшь, не томи» — согласие без явного aff-слова → хотя бы НЕ отрицание.
+  // №2 — ложная инвалидация: «не» перед НЕ-головой НЕ уничтожает план.
+  // ⚠️ ИЗМЕНЕНИЕ ПОСЛЕ ПЕРЕНОСА СТРОГОГО ПРОТОКОЛА: раньше «отправляй, не тяни»
+  // считалось согласием (старое правило «хоть один утвердительный токен»).
+  // Теперь согласие — только ответ, ЦЕЛИКОМ состоящий из понятных слов, а
+  // «тяни» серверу неизвестно → `ambiguous`. Главное свойство сохранено и
+  // усилено: фраза НЕ читается как отказ (план жив), но и не исполняется —
+  // при расхождении «эталон vs TS-логика частиц» приоритет у безопасности.
+  check("«отправляй, не тяни» ≠ negation (план не сжигается)", classifyReply("отправляй, не тяни", ctx) !== "negation");
+  check("«отправляй, не тяни» = ambiguous (строгость: «тяни» неизвестно)", classifyReply("отправляй, не тяни", ctx) === "ambiguous", classifyReply("отправляй, не тяни", ctx));
+  // «чего ждёшь, не томи» — тоже НЕ отрицание.
   check("«чего ждёшь, не томи» ≠ negation", classifyReply("чего ждёшь, не томи", ctx) !== "negation");
   // одиночная частица «не» сама по себе — НЕ отрицание.
-  check("одиночное «не» = unknown", classifyReply("не", ctx) === "unknown");
+  check("одиночное «не» = ambiguous (не отказ)", classifyReply("не", ctx) === "ambiguous", classifyReply("не", ctx));
 }
 
 // ── 15. интеграция: «not sure» не мутирует; «не тяни» не роняет манифест ─────
@@ -346,14 +362,22 @@ console.log("\n[15] интеграция: «not sure» → НЕ confirmed; «о�
   check("«not sure» → refused", dec.kind === "refused");
   check("«not sure» манифест НЕ DONE", store.manifests.get(id).status !== "DONE");
 
-  // №2 боевой сценарий: согласие с частицей «не» → confirmed, НЕ инвалидация.
+  // №2 боевой сценарий: частица «не» перед НЕ-головой НЕ уничтожает план.
+  // После переноса строгого протокола такая фраза больше не исполняется
+  // (незнакомый токен «тяни» ⇒ ambiguous), но КЛЮЧЕВОЕ свойство сохранено:
+  // манифест остаётся живым — модель может переспросить и получить чистое «да»,
+  // а не вынуждать человека перепланировать.
   clock.t = 1_700_000_000_000;
   const p2 = await buildPlan();
   const id2 = p2.dec.manifestId;
   clock.t += 3_000;
   const dec2 = await requireConsent({ tool: "drive_share", accountLabel: "personal", manifestId: id2, userReply: "отправляй, не тяни", plan, rehash, store: p2.store, cfg });
-  check("«отправляй, не тяни» → confirmed", dec2.kind === "confirmed", dec2.kind);
-  check("«отправляй, не тяни» манифест DONE, не INVALIDATED", p2.store.manifests.get(id2).status === "DONE");
+  check("«отправляй, не тяни» → refused (строгость)", dec2.kind === "refused", dec2.kind);
+  check("«отправляй, не тяни» манифест ЖИВ, НЕ INVALIDATED", p2.store.manifests.get(id2).status === "AWAITING_CONSENT", p2.store.manifests.get(id2).status);
+  // а чистое «да, шарь» после переспроса — исполняется
+  clock.t += 1_000;
+  const dec2b = await requireConsent({ tool: "drive_share", accountLabel: "personal", manifestId: id2, userReply: "да, шарь", plan, rehash, store: p2.store, cfg });
+  check("переспрос «да, шарь» по тому же плану → confirmed", dec2b.kind === "confirmed", dec2b.kind);
 
   // одиночное «не» в реплике не инвалидирует манифест (unknown → refuse, план жив).
   clock.t = 1_700_000_000_000;
