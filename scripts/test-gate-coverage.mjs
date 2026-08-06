@@ -37,6 +37,7 @@ import { registerDocsTools } from "../dist/tools/docs.js";
 import { registerSkillVersionTools } from "../dist/tools/skill_version.js";
 import { registerAccountTools } from "../dist/accounts.js";
 import { initDownloads } from "../dist/downloads.js";
+import { registeredAutoExecuteTools } from "../dist/autoExecute.js";
 
 let failures = 0;
 const check = (label, cond, extra = "") => {
@@ -322,6 +323,14 @@ console.log("\n[5] read tools genuinely carry readOnlyHint (spot-check, not exha
 for (const name of ["drive_search", "drive_get_metadata", "drive_download_file", "drive_get_permissions", "drive_extract_text", "drive_confirm_upload", "drive_consent_audit", "docs_list", "docs_read", "list_accounts"]) {
   const t = tools.find((x) => x.name === name);
   check(`${name} readOnlyHint: true`, t?.annotations?.readOnlyHint === true, JSON.stringify(t?.annotations));
+}
+
+console.log("\n[6] every gated tool can also be executed by the Telegram button (auto-executor registered)");
+// Иначе подтверждение кнопкой переключило бы флаг, а само действие не
+// наступило бы никогда, пока модель не позовёт инструмент второй раз.
+const autoTools = new Set(registeredAutoExecuteTools());
+for (const name of Object.keys(GATED_TOOLS)) {
+  check(`${name} has an auto-executor`, autoTools.has(name), [...autoTools].join(", "));
 }
 
 restoreFetch();
