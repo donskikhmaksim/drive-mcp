@@ -72,6 +72,17 @@ const UNGATED_WRITE_ALLOWLIST = {
     "Status query only: a zero-length PUT (\"Content-Range: bytes */<total>\") against a resumable session Google already finalised or not — calling it 0, 1 or many times changes nothing. The write it reports on was gated at session creation (drive_create_upload_session), the last point this server controls before bytes move client→Google directly. It is listed here (not annotated read-only) because it DOES make an outgoing request to an address taken from an argument — the surface guarded by assertGoogleUploadUrl (scripts/test-confirm-upload-ssrf.mjs).",
 };
 
+/** Fixture for skill_version_update: the tool only accepts a folder that is
+ * REALLY a direct child of Skills/ (post-check on `parents`, see
+ * src/tools/skill_version.ts's `isChildOf`), so the fake Drive below must
+ * answer with a folder whose `name`/`parents` match what was asked — exactly
+ * what the live API returns. Same literal id as
+ * `SKILLS_ROOT_FOLDER_ID` in src/tools/skill_version.ts (not exported; also
+ * duplicated in scripts/test-skill-version-injection.mjs). */
+const SKILLS_ROOT_FOLDER_ID = "1kjYll-ULT_Z1CFG80HcwgJR6AaS6CVg9";
+const SKILL_FIXTURE_NAME = "test_skill";
+const SKILL_FIXTURE_FOLDER_ID = "SKILLFOLDER1";
+
 /** Every gated write tool, with args that reach its plan phase, which
  * counter must stay at 0 after a plan-only call, and the expected
  * destructiveHint from src/tools/*.ts's own `annotations`. */
@@ -156,7 +167,7 @@ const GATED_TOOLS = {
     destructive: true,
   },
   skill_version_update: {
-    args: { skill_name: "test_skill", new_version: "9.9", new_content: "# content" },
+    args: { skill_name: SKILL_FIXTURE_NAME, new_version: "9.9", new_content: "# content" },
     counterKey: "filesCreate",
     destructive: false,
   },
@@ -301,11 +312,18 @@ function buildClients(counters) {
             },
           }),
           list: async ({ q }) => {
-            // skill_version_update: folder lookups (skill folder + versions/)
-            // succeed with a fake folder; the "current top file" lookup
-            // returns none (so it's a brand-new skill — no collision).
+            // skill_version_update: folder lookups answer like the live API —
+            // the folder that was actually asked for, WITH its `name` and
+            // `parents`, because the tool re-checks both before it will touch
+            // anything (fail-closed post-check on `parents`). The "current top
+            // file" lookup returns none (brand-new skill — no collision).
             if (String(q).includes("mimeType='application/vnd.google-apps.folder'")) {
-              return { data: { files: [{ id: "SKILLFOLDER1", name: "folder" }] } };
+              if (String(q).includes(`name='${SKILL_FIXTURE_NAME}'`)) {
+                return { data: { files: [{ id: SKILL_FIXTURE_FOLDER_ID, name: SKILL_FIXTURE_NAME, parents: [SKILLS_ROOT_FOLDER_ID] }] } };
+              }
+              if (String(q).includes("name='versions'")) {
+                return { data: { files: [{ id: "VERSIONS1", name: "versions", parents: [SKILL_FIXTURE_FOLDER_ID] }] } };
+              }
             }
             return { data: { files: [] } };
           },
