@@ -24,8 +24,13 @@ import {
   type ConsentStore,
   type ConsentConfig,
   type ConsentAddressing,
+  // Тип берётся ИЗ consent.js, а не из tg_approval.js: gate, который реально
+  // передаётся в `requireConsent`, обязан уметь ещё и `hasAutoExecutor(tool)`
+  // (вторая половина правила «исполнение только кнопкой»). Если типизировать
+  // его версией из tg_approval.js, расхождение всплыло бы уже в проде —
+  // здесь оно падает на СБОРКЕ.
+  type TgApprovalGate,
 } from "../consent.js";
-import type { TgApprovalGate } from "../tg_approval.js";
 import { registerAutoExecutor, type AutoExecutorCtx } from "../autoExecute.js";
 
 // ── Consent-gate context (shared across drive.ts/docs.ts/skill_version.ts) ──
@@ -102,6 +107,11 @@ export interface DriveConsentContext {
    * `requireConsent({ ... })` call in this file below destructures `tg` from
    * `ctx` and passes it through (`tg,` shorthand). Setting
    * TG_APPROVAL_ENABLED=true does have runtime effect here.
+   *
+   * Since 2026-08-06 the gate must ALSO answer `hasAutoExecutor(tool)` — hence
+   * the type comes from `../consent.js`, not from `../tg_approval.js`: a plan
+   * that went out as a button AND has an auto-executor is executed ONLY by the
+   * button (see `isTgButtonOnly`), and the text path is closed for it.
    */
   tg?: TgApprovalGate;
 }

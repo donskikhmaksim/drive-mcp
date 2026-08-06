@@ -5,15 +5,17 @@ import { buildUserClients, registerAccountTools } from "./accounts.js";
 import { registerDriveTools, type DriveConsentContext } from "./tools/drive.js";
 import { registerDocsTools } from "./tools/docs.js";
 import { registerSkillVersionTools } from "./tools/skill_version.js";
-import type { ConsentStore, ConsentConfig } from "./consent.js";
-import type { TgApprovalGate, TgApprovalStore } from "./tg_approval.js";
+import type { ConsentStore, ConsentConfig, TgApprovalGate as ConsentTgApprovalGate } from "./consent.js";
+import type { TgApprovalStore } from "./tg_approval.js";
 import { createTgApprovalGate } from "./tg_approval.js";
+import { getAutoExecutor } from "./autoExecute.js";
 import {
   storeReady,
   createManifest,
   getManifest,
   consumeManifest,
   invalidateManifest,
+  markTgNotified,
   appendConsentAudit,
   updateConsentAuditOutcome,
   listConsentAudit,
@@ -35,6 +37,7 @@ export const consentStoreAdapter: ConsentStore = {
   getManifest,
   consumeManifest,
   invalidateManifest,
+  markTgNotified,
   appendConsentAudit,
   updateConsentAuditOutcome,
 };
@@ -92,8 +95,19 @@ export const tgApprovalStoreAdapter: TgApprovalStore = {
  * `DriveConsentContext.tg` below, and every `drive`/`docs`/`skill_version`
  * write tool's `requireConsent(...)` call passes `tg: ctx.tg` (via
  * destructuring), so `TG_APPROVAL_ENABLED=true` does affect tool behaviour.
+ *
+ * `hasAutoExecutor` is added HERE (not inside `createTgApprovalGate`, which
+ * stays a portable Telegram-only module): it answers consent.ts's "is there
+ * anything that can execute this plan on a button press", which is the second
+ * half of the button-only rule (`isTgButtonOnly`). It is a RULE BY PROPERTY,
+ * not a list of tool names — any tool that gains an auto-executor becomes
+ * button-only automatically, and any tool that loses one degrades softly back
+ * to the ordinary text path instead of becoming unexecutable.
  */
-export const tgApprovalGate: TgApprovalGate = createTgApprovalGate(tgApprovalConfig, tgApprovalStoreAdapter);
+export const tgApprovalGate: ConsentTgApprovalGate = {
+  ...createTgApprovalGate(tgApprovalConfig, tgApprovalStoreAdapter),
+  hasAutoExecutor: (tool: string) => getAutoExecutor(tool) !== undefined,
+};
 
 export function buildMcpServer(user: User): McpServer {
   const clients = buildUserClients(user);

@@ -1,0 +1,30 @@
+name: Typecheck and tests
+
+# Builds the server and runs the whole offline test suite (npm test), including
+# the reflective gate-coverage check that every tool with a real side effect is
+# consent-gated or explicitly allowlisted, and the SSRF check on
+# drive_confirm_upload. Until this job existed, CI ran ONLY the GUIDE.md
+# freshness check — so a broken gate would have shipped green.
+#
+# Everything here is offline and secret-free by construction: Google/Telegram
+# are stubbed (fake clients, a stubbed global `fetch`, undici's MockAgent that
+# blocks real net connections), the consent store is in-memory, and the one
+# test that speaks HTTP does so to 127.0.0.1 inside its own process tree.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test

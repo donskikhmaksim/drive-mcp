@@ -151,6 +151,15 @@ export async function ensureSchema(): Promise<void> {
   await p.query(
     `CREATE INDEX IF NOT EXISTS consent_manifests_cleanup_idx ON consent_manifests (server, status, expires_at)`,
   );
+  // «Этот план ушёл в Telegram кнопкой» — ставится РОВНО в одном месте:
+  // consent.ts's plan-фаза, сразу после того как `notifyPlan` вернул успех.
+  // Признак СОСТОЯНИЯ ПЛАНА, а не текущей настройки: выключение
+  // TG_APPROVAL_ENABLED между планом и исполнением НЕ должно снимать
+  // требование кнопки (см. `isTgButtonOnly` в consent.ts). Аддитивная
+  // миграция — DEFAULT FALSE, поэтому старые строки ведут себя как раньше.
+  await p.query(
+    `ALTER TABLE consent_manifests ADD COLUMN IF NOT EXISTS tg_notified BOOLEAN NOT NULL DEFAULT FALSE`,
+  );
   // Append-only audit trail. Written in two phases (plan §0.4/[R:полнота-3]):
   // appendConsentAudit() at the gate DECISION (confirmed/refused/invalidated),
   // then updateConsentAuditOutcome() fills in what the MUTATION actually did
@@ -570,6 +579,9 @@ export interface ConsentManifestRow {
   expiresAt: number;
   consumedAt: number | null;
   userReply: string | null;
+  /** План ушёл в Telegram кнопкой (см. `markTgNotified` / consent.ts's
+   * `isTgButtonOnly`). Старые строки — false по DEFAULT. */
+  tgNotified: boolean;
 }
 
 export interface ConsentAuditEntry {
@@ -599,6 +611,7 @@ function rowToManifest(row: {
   expires_at: string | number;
   consumed_at: string | number | null;
   user_reply: string | null;
+  tg_notified?: boolean | null;
 }): ConsentManifestRow {
   return {
     id: row.id,
@@ -612,6 +625,7 @@ function rowToManifest(row: {
     expiresAt: Number(row.expires_at),
     consumedAt: row.consumed_at === null ? null : Number(row.consumed_at),
     userReply: row.user_reply,
+    tgNotified: row.tg_notified === true,
   };
 }
 
@@ -685,6 +699,23 @@ export async function consumeManifest(
   );
   if (!res.rows.length) return null;
   return rowToManifest(res.rows[0]);
+}
+
+/**
+ * Отмечает, что план ушёл в Telegram кнопкой. Вызывается consent.ts РОВНО в
+ * одном месте — сразу после успешного `notifyPlan` (если отправка провалилась,
+ * манифест инвалидируется, а не помечается). Дальше этот флаг — единственный
+ * источник истины для `isTgButtonOnly`: решение принимается по СОСТОЯНИЮ ПЛАНА,
+ * а не по текущему значению TG_APPROVAL_ENABLED, иначе выключение переменной
+ * между планом и исполнением сняло бы требование кнопки.
+ */
+export async function markTgNotified(id: string, server: string): Promise<void> {
+  const p = getPool();
+  await p.query(
+    `UPDATE consent_manifests SET tg_notified = TRUE
+      WHERE id = $1 AND server = $2 AND status = 'AWAITING_CONSENT'`,
+    [id, server],
+  );
 }
 
 /** Marks a manifest INVALIDATED (explicit user negation). No-op if it's not

@@ -2,22 +2,18 @@
 /**
  * Offline unit-тест опционального Telegram-approval слоя (`src/tg_approval.ts`).
  *
- * ОТЛИЧИЕ ОТ gmail-mcp/scripts/test-tg-approval.mjs (важно прочитать перед
- * правкой): в gmail-mcp этот файл гоняет весь сценарий ЧЕРЕЗ
- * `requireConsent({ ..., tg: gate })`, потому что gmail-mcp's `src/consent.ts`
- * умеет читать `p.tg` (branch `if (p.tg?.enabledFor(tool))` внутри
- * `requireConsent`). В drive-mcp ЭТА врезка НЕ портирована (сознательно, по
- * прямому указанию задачи — "НЕ трогай src/consent.ts... если там нет
- * TgApprovalGate/ветки p.tg — сообщи, не редактируй сам"; в drive-mcp
- * `consent.ts` действительно нет ни поля `tg` на `RequireConsentParams`, ни
- * самих веток). Поэтому здесь тестируется САМ `tg_approval.ts` напрямую —
- * фабрика гейта (`createTgApprovalGate`: enabledFor/notifyPlan/checkApproval)
- * и webhook (`handleWebhook`/`registerWebhook`/`secretTokenMatches`) — то, что
- * РЕАЛЬНО подключено (`server.ts`'s `tgApprovalGate`, `DriveConsentContext.tg`,
- * `http.ts`'s `/tg/webhook`). Секция [0] отдельно ДОКАЗЫВАЕТ разрыв: показывает,
- * что `requireConsent()` в этом репо ведёт себя ОДИНАКОВО с `tg` и без него —
- * когда эта врезка будет портирована в consent.ts, секция [0] начнёт падать
- * и должна быть переписана в духе секций [1]-[7b] gmail-mcp's версии.
+ * ЧТО ЗДЕСЬ ПОКРЫТО: сам `tg_approval.ts` — фабрика гейта
+ * (`createTgApprovalGate`: enabledFor/notifyPlan/checkApproval) и webhook
+ * (`handleWebhook`/`registerWebhook`/`secretTokenMatches`), плюс секция [0] —
+ * интеграция с `requireConsent()`.
+ *
+ * ⚠️ ИСПРАВЛЕНО (устаревший комментарий врал): раньше эта шапка утверждала, что
+ * врезка `tg` в `consent.ts` «НЕ портирована» и что секция [0] доказывает
+ * разрыв. Это неверно с 2026-08-05: у `RequireConsentParams` есть поле `tg`,
+ * внутри `requireConsent` есть ветки `p.tg?.enabledFor(tool)`, и секция [0]
+ * ниже как раз проверяет, что `requireConsent` САМ шлёт sendMessage. Поведение
+ * «исполнение только кнопкой» (метка `tgNotified` + `hasAutoExecutor`)
+ * покрыто отдельным файлом — scripts/test-button-only.mjs.
  *
  * Никакого реального Telegram и никакой БД — Telegram Bot API замокан через
  * undici's MockAgent (тот же HTTP-клиент, что использует сам модуль в проде),
@@ -71,7 +67,7 @@ function makeConsentStore() {
     manifests,
     audits,
     async createManifest(input) {
-      manifests.set(input.id, { ...input, status: "AWAITING_CONSENT", consumedAt: null, userReply: null });
+      manifests.set(input.id, { ...input, status: "AWAITING_CONSENT", consumedAt: null, userReply: null, tgNotified: false });
     },
     async getManifest(id, server) {
       const r = manifests.get(id);
@@ -95,6 +91,12 @@ function makeConsentStore() {
         r.userReply = userReply;
       }
     },
+    /** Метка «план ушёл кнопкой» — часть контракта ConsentStore с момента
+     * переноса защиты «исполнение только кнопкой» (см. test-button-only.mjs). */
+    async markTgNotified(id, server) {
+      const r = manifests.get(id);
+      if (r && r.server === server && r.status === "AWAITING_CONSENT") r.tgNotified = true;
+    },
     async appendConsentAudit(entry) {
       audits.push({ ...entry });
     },
@@ -103,6 +105,16 @@ function makeConsentStore() {
       if (a) Object.assign(a, outcome);
     },
   };
+}
+
+/**
+ * `createTgApprovalGate` — переносимый Telegram-модуль, он ничего не знает про
+ * реестр авто-исполнителей. Вторую половину контракта (`hasAutoExecutor`)
+ * инжектирует server.ts; здесь повторяем то же самое, чтобы гейт из фабрики
+ * можно было передать в `requireConsent`.
+ */
+function withAutoExecutor(gate, has = true) {
+  return { ...gate, hasAutoExecutor: () => has };
 }
 
 // ── in-memory TgApprovalStore — тот же атомарный контракт, что store.ts ────
@@ -178,7 +190,7 @@ console.log("\n[0] requireConsent({ tg }) — план с включённым T
   mock("sendMessage", () => ({ statusCode: 200, data: { ok: true, result: { message_id: 1 } }, headers: { "content-type": "application/json" } }));
 
   const tgStore = makeTgStore();
-  const gate = createTgApprovalGate(tgCfg({ enabled: true }), tgStore, now);
+  const gate = withAutoExecutor(createTgApprovalGate(tgCfg({ enabled: true }), tgStore, now));
 
   const storeA = makeConsentStore();
   const decA = await requireConsent({ tool: "drive_create_folder", accountLabel: "work", plan, rehash, store: storeA, cfg: consentCfg });
