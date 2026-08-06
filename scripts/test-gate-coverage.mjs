@@ -19,22 +19,33 @@
  * Per Maksim's standing decision (2026-08-04, "гейт у ВСЕХ write, без
  * исключений") the allowlist stays tiny and every entry carries a reason.
  *
- * ⚠️ WHAT THIS FILE STILL CANNOT DO (2026-08-06). Classification here is the
- * tool's OWN `readOnlyHint`, i.e. a hand-written label. That is precisely how
- * drive_extract_text hid for months: it declared readOnlyHint:true while
- * copying a file and permanently deleting the copy, so it was counted as a
- * READ and its allowlist entry below could never fire. The label has now been
- * removed from the two tools that were lying (drive_extract_text,
- * drive_confirm_upload) and both are named in the allowlist for real — but the
- * NEXT such tool would hide just as easily. gmail-mcp already replaced this
- * rule with a static scan of the sources for side-effect markers
- * (`scripts/test-gate-coverage.mjs` there); porting that scan here — with
- * Drive-shaped markers (files.create/update/delete/copy, permissions.*,
- * documents.batchUpdate, raw fetch, issueDownloadLink) — is the actual fix and
- * is tracked separately.
+ * CLASSIFICATION NO LONGER TRUSTS THE TOOL'S OWN LABEL (ported from gmail-mcp
+ * 2026-08-06). A tool is a WRITE if EITHER it lacks `readOnlyHint: true` OR a
+ * static scan of the sources finds a real side effect in the code it reaches.
+ *
+ * Why this matters more than the two fixes that prompted it. Until today the
+ * rule here was the tool's own hand-written `readOnlyHint`, and that is
+ * exactly how two tools hid: `drive_extract_text` declared `readOnlyHint: true`
+ * while copying a file and permanently deleting the copy, and
+ * `drive_confirm_upload` KEPT its `readOnlyHint: true` even after its own SSRF
+ * hole was fixed — the behaviour was repaired and the sign left hanging. Both
+ * were counted as READS, so their allowlist entries below could never fire.
+ * That is a repeating failure mode, not two accidents: people fix behaviour
+ * and forget to take down the label. A label is a claim; this file now checks
+ * the claim against the code.
+ *
+ * Scope of the scan (deliberately narrow, so it cannot cry wolf): the markers
+ * are genuine changes out in the world or capabilities handed out — Drive
+ * files.create/update/delete/copy, permissions.*, Docs documents.create/
+ * batchUpdate, raw fetch(), outbound safeGoogleFetch(), issueDownloadLink(),
+ * and writes into this server's own upload-session store. Verified against the
+ * live registry when ported: 18 writes / 8 reads, zero false positives.
  *
  * Usage: node scripts/test-gate-coverage.mjs
  */
+import { readFileSync, readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -51,6 +62,116 @@ const check = (label, cond, extra = "") => {
   if (!cond) failures++;
 };
 const text = (r) => r.content[0].text;
+
+// ── static scan of the sources for REAL side effects ───────────────────────
+// Ported from gmail-mcp with Drive-shaped markers. The point is to classify a
+// tool by what its code DOES, not by what its annotation SAYS.
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const SOURCE_FILES = [
+  ...readdirSync(join(ROOT, "src", "tools"))
+    .filter((f) => f.endsWith(".ts"))
+    .map((f) => join(ROOT, "src", "tools", f)),
+  join(ROOT, "src", "accounts.ts"),
+];
+
+/** Each marker is a genuine change out in the world (or a capability handed
+ * out), never a naming convention — a false positive here would train people
+ * to silence this test, which is worse than the hole it closes. */
+const SIDE_EFFECT_MARKERS = [
+  ["drive files.create/update/delete/copy", /\bfiles\s*\.\s*(?:create|update|delete|copy)\s*\(/],
+  ["drive permissions.create/update/delete", /\bpermissions\s*\.\s*(?:create|update|delete)\s*\(/],
+  ["docs documents.create/batchUpdate", /\bdocuments\s*\.\s*(?:create|batchUpdate)\s*\(/],
+  ["raw fetch()", /(?<![A-Za-z0-9_$.])fetch\s*\(/],
+  // Исходящий запрос через проверенный транспорт — всё равно запрос НАРУЖУ.
+  // Прятаться за тем, что он «безопасный», нельзя: маркер ловит ровно то же,
+  // что и голый fetch(, просто после переезда на safeFetch.ts.
+  ["outbound request (safeGoogleFetch)", /\bsafeGoogleFetch\s*\(/],
+  ["capability minted (issueDownloadLink)", /\bissueDownloadLink\s*\(/],
+  ["own store write", /\b(?:rememberUploadSession)\s*\(/],
+];
+
+/** Reads the balanced {...} block that starts at/after `from`. */
+function bracedBlockAt(src, from) {
+  const start = src.indexOf("{", from);
+  if (start < 0) return "";
+  let depth = 0;
+  for (let i = start; i < src.length; i++) {
+    const c = src[i];
+    if (c === "{") depth++;
+    else if (c === "}" && --depth === 0) return src.slice(start, i + 1);
+  }
+  return src.slice(start);
+}
+
+/** Module-level functions, by name → body. Covers both declaration styles
+ * used in this repo (`function f()` and `const f = async (…) => {`). */
+function moduleFunctions(src) {
+  const out = new Map();
+  const decl = /^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z0-9_$]+)\s*\(/gm;
+  const arrow = /^(?:export\s+)?const\s+([A-Za-z0-9_$]+)\s*(?::[^=\n]+)?=\s*(?:async\s*)?\([^)]*\)\s*(?::[^=>\n]+)?=>\s*\{/gm;
+  for (const re of [decl, arrow]) {
+    let m;
+    while ((m = re.exec(src))) out.set(m[1], bracedBlockAt(src, m.index));
+  }
+  return out;
+}
+
+/** Every `server.registerTool("name", …)` block: from its own call up to the
+ * next registration (or EOF). */
+function toolBlocks(src) {
+  const re = /server\.registerTool\(\s*["']([^"']+)["']/g;
+  const marks = [];
+  let m;
+  while ((m = re.exec(src))) marks.push({ name: m[1], at: m.index });
+  return marks.map((mk, i) => ({
+    name: mk.name,
+    code: src.slice(mk.at, i + 1 < marks.length ? marks[i + 1].at : src.length),
+  }));
+}
+
+/** Block code + the bodies of every module-level function it reaches — a tool
+ * that hides its write one call deep is still a write. */
+function reachableCode(blockCode, fns) {
+  const seen = new Set();
+  const parts = [blockCode];
+  const queue = [blockCode];
+  const callRe = /\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g;
+  while (queue.length) {
+    const code = queue.shift();
+    let m;
+    callRe.lastIndex = 0;
+    while ((m = callRe.exec(code))) {
+      const name = m[1];
+      if (seen.has(name) || !fns.has(name)) continue;
+      seen.add(name);
+      const body = fns.get(name);
+      parts.push(body);
+      queue.push(body);
+    }
+  }
+  return parts.join("\n");
+}
+
+/** name → [marker labels] for every tool found in source. */
+function scanSideEffects() {
+  const found = new Map();
+  for (const file of SOURCE_FILES) {
+    const src = readFileSync(file, "utf8");
+    const fns = moduleFunctions(src);
+    for (const { name, code } of toolBlocks(src)) {
+      const all = reachableCode(code, fns);
+      const markers = SIDE_EFFECT_MARKERS.filter(([, re]) => re.test(all)).map(([label]) => label);
+      const prev = found.get(name) ?? [];
+      found.set(name, [...new Set([...prev, ...markers])]);
+    }
+  }
+  return found;
+}
+
+const SIDE_EFFECTS = scanSideEffects();
+const hasSideEffect = (name) => (SIDE_EFFECTS.get(name) ?? []).length > 0;
+const markersOf = (name) => SIDE_EFFECTS.get(name) ?? [];
 
 const UNGATED_WRITE_ALLOWLIST = {
   drive_extract_text:
@@ -291,9 +412,17 @@ const { cli, counters, restoreFetch } = await harness();
 const tools = (await cli.listTools()).tools;
 check("registry is non-empty (sanity)", tools.length > 10, String(tools.length));
 
-const writes = tools.filter((t) => t.annotations?.readOnlyHint !== true);
-const reads = tools.filter((t) => t.annotations?.readOnlyHint === true);
+// Классификация НЕ по одной лишь самопометке: тул считается write, если он
+// либо не заявил readOnlyHint, либо статический скан нашёл у него настоящий
+// побочный эффект. Второе условие и есть то, чего здесь не хватало: ровно так
+// прятались drive_extract_text и drive_confirm_upload.
+const writes = tools.filter((t) => hasSideEffect(t.name) || t.annotations?.readOnlyHint !== true);
+const reads = tools.filter((t) => !hasSideEffect(t.name) && t.annotations?.readOnlyHint === true);
 console.log(`   ${tools.length} tool(s) total: ${reads.length} read-only, ${writes.length} write`);
+for (const t of writes) {
+  const why = hasSideEffect(t.name) ? `side effects: ${markersOf(t.name).join(", ")}` : "no readOnlyHint";
+  console.log(`     write: ${t.name.padEnd(30)} ${why}`);
+}
 
 console.log("\n[2] every write tool is EITHER in GATED_TOOLS OR in the explicit allowlist");
 const unexpected = [];
@@ -304,6 +433,18 @@ for (const t of writes) {
   if (!gated && !allowlisted) unexpected.push(t.name);
 }
 check("no unexpected ungated write tools slipped in", unexpected.length === 0, unexpected.join(", "));
+
+console.log("\n[2b] a tool with a REAL side effect must NOT claim readOnlyHint (no hiding behind the label)");
+// Именно эта проверка ловит повторяющуюся ошибку «починили поведение, а
+// вывеску забыли снять»: так drive_confirm_upload пережил починку собственной
+// дыры, оставшись помеченным как «только чтение».
+for (const t of tools.filter((x) => hasSideEffect(x.name))) {
+  check(
+    `${t.name} does not claim readOnlyHint (${markersOf(t.name).join(", ")})`,
+    t.annotations?.readOnlyHint !== true,
+    JSON.stringify(t.annotations),
+  );
+}
 check(
   "no write tool is missing from GATED_TOOLS (count sanity)",
   writes.length === Object.keys(GATED_TOOLS).length + Object.keys(UNGATED_WRITE_ALLOWLIST).filter((n) => writes.some((w) => w.name === n)).length,
