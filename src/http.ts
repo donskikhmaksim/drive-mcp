@@ -20,6 +20,7 @@ import {
 import { renderDashboard } from "./dashboard.js";
 import { initDownloads, resolveDownloadLink } from "./downloads.js";
 import { buildUserClients } from "./accounts.js";
+import type { GoogleClients } from "./google.js";
 import { selectAccountsForLegacyToken } from "./credentialSource.js";
 
 const JSONRPC_UNAUTHORIZED = {
@@ -80,6 +81,84 @@ async function userFromGoogleAccounts(config: Config): Promise<User | null> {
 function contentDisposition(name: string): string {
   const ascii = name.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_");
   return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+}
+
+/**
+ * `GET /dl/<token>` — отдача одного файла по временной ссылке.
+ *
+ * Вынесено из `startHttpServer` отдельной фабрикой, чтобы (а) резолв
+ * Google-клиента инжектировался, и (б) заголовки безопасности этого маршрута
+ * можно было проверить офлайн-тестом на ТОМ ЖЕ коде, который работает в
+ * проде (scripts/test-download-headers.mjs). Поведение не менялось.
+ *
+ * `resolveClients(account)` возвращает null, если к серверу больше не
+ * привязан ни один Google-аккаунт.
+ */
+export function createDownloadHandler(
+  resolveClients: (account: string) => Promise<GoogleClients | null>,
+) {
+  return async (req: Request, res: Response): Promise<void> => {
+    const target = await resolveDownloadLink(String(req.params.token));
+    if (!target) {
+      res.status(404).type("text/plain").send("This download link is invalid or has expired.");
+      return;
+    }
+    try {
+      const g = await resolveClients(target.account);
+      if (!g) {
+        res.status(503).type("text/plain").send("No Google account is linked to this server any more.");
+        return;
+      }
+      // Pass the client's Range through so big downloads can resume.
+      const range = req.header("range");
+      const options = {
+        responseType: "stream" as const,
+        headers: range ? { Range: range } : undefined,
+      };
+      const gres = target.exportMime
+        ? await g.drive.files.export({ fileId: target.fileId, mimeType: target.exportMime }, options)
+        : await g.drive.files.get(
+            { fileId: target.fileId, alt: "media", supportsAllDrives: true },
+            options,
+          );
+
+      // Заголовки ставятся ДО начала пайпа и одинаково для 200 и 206 —
+      // после `stream.pipe(res)` их выставить уже нельзя.
+      res.status(gres.status === 206 ? 206 : 200);
+      res.setHeader("Content-Type", target.mimeType);
+      res.setHeader("Content-Disposition", contentDisposition(target.name));
+      // `Content-Disposition: attachment` (выше) уже не даёт браузеру
+      // отрендерить этот ответ как страницу при переходе по ссылке. Но оно НЕ
+      // мешает загрузить тот же URL ПОДРЕСУРСОМ чужой страницы (<script
+      // src=…>, <object>, <embed>): там браузер вправе определить тип по
+      // содержимому и исполнить загруженный HTML/JS. `nosniff` это закрывает —
+      // тип берётся только из Content-Type (security-checklist.md §10,
+      // «файлы и загрузки»). Вторая линия обороны: эксплуатация всё равно
+      // требует знания секретной ссылки.
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      res.setHeader("Accept-Ranges", "bytes");
+      // The link is a secret; keep proxies and shared caches out of it.
+      res.setHeader("Cache-Control", "private, no-store");
+      const length = gres.headers["content-length"];
+      if (length) res.setHeader("Content-Length", length);
+      const contentRange = gres.headers["content-range"];
+      if (contentRange) res.setHeader("Content-Range", contentRange);
+
+      const stream = gres.data as unknown as NodeJS.ReadableStream;
+      stream.on("error", (err: Error) => {
+        console.error("Download stream error:", err.message);
+        res.destroy(err);
+      });
+      stream.pipe(res);
+    } catch (err) {
+      console.error("Download error:", err);
+      if (!res.headersSent) {
+        res.status(502).type("text/plain").send("Could not fetch this file from Google.");
+      } else {
+        res.destroy();
+      }
+    }
+  };
 }
 
 /** Constant-time compare for the dashboard path secret. */
@@ -220,58 +299,19 @@ export async function startHttpServer(config: Config): Promise<void> {
   // ---- Temporary download links minted by drive_get_download_url ----
   // Deliberately unauthenticated: the unguessable, expiring token in the path
   // IS the credential, and it authorises exactly one file. See downloads.ts.
-  app.get("/dl/:token", async (req: Request, res: Response) => {
-    const target = await resolveDownloadLink(String(req.params.token));
-    if (!target) {
-      res.status(404).type("text/plain").send("This download link is invalid or has expired.");
-      return;
-    }
-    const user = (await userFromGoogleAccounts(config)) ?? config.users[0] ?? null;
-    if (!user) {
-      res.status(503).type("text/plain").send("No Google account is linked to this server any more.");
-      return;
-    }
-    try {
-      const g = buildUserClients(user).resolve(target.account);
-      // Pass the client's Range through so big downloads can resume.
-      const range = req.header("range");
-      const options = {
-        responseType: "stream" as const,
-        headers: range ? { Range: range } : undefined,
-      };
-      const gres = target.exportMime
-        ? await g.drive.files.export({ fileId: target.fileId, mimeType: target.exportMime }, options)
-        : await g.drive.files.get(
-            { fileId: target.fileId, alt: "media", supportsAllDrives: true },
-            options,
-          );
-
-      res.status(gres.status === 206 ? 206 : 200);
-      res.setHeader("Content-Type", target.mimeType);
-      res.setHeader("Content-Disposition", contentDisposition(target.name));
-      res.setHeader("Accept-Ranges", "bytes");
-      // The link is a secret; keep proxies and shared caches out of it.
-      res.setHeader("Cache-Control", "private, no-store");
-      const length = gres.headers["content-length"];
-      if (length) res.setHeader("Content-Length", length);
-      const contentRange = gres.headers["content-range"];
-      if (contentRange) res.setHeader("Content-Range", contentRange);
-
-      const stream = gres.data as unknown as NodeJS.ReadableStream;
-      stream.on("error", (err: Error) => {
-        console.error("Download stream error:", err.message);
-        res.destroy(err);
-      });
-      stream.pipe(res);
-    } catch (err) {
-      console.error("Download error:", err);
-      if (!res.headersSent) {
-        res.status(502).type("text/plain").send("Could not fetch this file from Google.");
-      } else {
-        res.destroy();
-      }
-    }
-  });
+  // The handler itself lives in `createDownloadHandler` (module level, below
+  // this function) so scripts/test-download-headers.mjs can exercise the very
+  // same code with a stubbed Drive client — the real googleapis client cannot
+  // be intercepted offline (google-auth-library does not go through undici's
+  // MockAgent), and this route's security headers must stay under test.
+  app.get(
+    "/dl/:token",
+    createDownloadHandler(async (account) => {
+      const user = (await userFromGoogleAccounts(config)) ?? config.users[0] ?? null;
+      if (!user) return null;
+      return buildUserClients(user).resolve(account);
+    }),
+  );
 
   let provider: GoogleFederatedProvider | null = null;
 
