@@ -192,11 +192,21 @@ export async function startHttpServer(config: Config): Promise<void> {
     // file to the other 5 repos remembering to not mount the route --
     // 404 (not 401) so a non-owner server doesn't even reveal the route exists.
     //
-    // drive-mcp NEVER owns this webhook (see server.ts's `tgApprovalGate`
-    // honest note) -- gmail-mcp is the designated owner. This guard is what
-    // makes that safe to leave mounted unconditionally: TG_WEBHOOK_OWNER must
-    // never be set to "true" on this server.
-    if (!tgApprovalConfig.webhookOwner) {
+    // drive-mcp NEVER owns the SHARED webhook (see server.ts's `tgApprovalGate`
+    // honest note) -- gmail-mcp is the designated owner of that path.
+    // TG_WEBHOOK_OWNER must never be set to "true" on this server.
+    //
+    // TG_BOT_TOKEN_OVERRIDE (config.ts's `ownBot`) is the ONE feature-flag
+    // exception, added on top without touching the guard above: when this
+    // server has been given its own Telegram bot token, its `/tg/webhook`
+    // stops being a shared route at all -- it's this server's own bot's
+    // updates, and no other server can register against the same URL/token,
+    // so the fleet-wide collision `webhookOwner` guards against does not
+    // apply. Backward compatible by construction: `ownBot` is false unless
+    // TG_BOT_TOKEN_OVERRIDE is explicitly set, so an unset flag reproduces
+    // the exact bitwise-identical gate this route had before this flag
+    // existed.
+    if (!tgApprovalConfig.webhookOwner && !tgApprovalConfig.ownBot) {
       res.status(404).end();
       return;
     }

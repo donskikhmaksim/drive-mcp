@@ -312,13 +312,21 @@ export function secretTokenMatches(provided: string, expected: string): boolean 
  *  2. owner-only          — `callback_query.from.id === TG_OWNER_CHAT_ID`.
  *  3. callback_data is an ADDRESS, not a trust fact — the decision is read
  *     back from the store by manifest_id; the button's own label is never
- *     taken at face value. The manifest may belong to ANY of the servers
- *     sharing this bot token (single shared webhook — see `registerWebhook`'s
+ *     taken at face value. When `cfg.ownBot` is false (the shared-bot
+ *     default), the manifest may belong to ANY of the servers sharing this
+ *     bot token (single shared webhook — see `registerWebhook`'s
  *     `TG_WEBHOOK_OWNER` guard), not necessarily this process's own `cfg.
- *     server` — hence `consumeTgDecisionAnyServer` below, not the server-
- *     scoped `consumeTgDecision`.
- *  4. anti-replay         — atomic `consumeTgDecisionAnyServer` (`WHERE
- *     status = 'PENDING'`); a second tap on the same callback is a no-op here.
+ *     server` — hence `consumeTgDecisionAnyServer`, not the server-scoped
+ *     `consumeTgDecision`, in that case. When `cfg.ownBot` is true
+ *     (TG_BOT_TOKEN_OVERRIDE, config.ts), this webhook is known to belong to
+ *     exactly ONE server's own bot — nothing else can be listening on this
+ *     token's updates — so the server-scoped `consumeTgDecision(manifestId,
+ *     cfg.server, …)` is used instead: strictly safer (an extra belt-and-
+ *     braces filter on `server`, on top of the still-globally-unique
+ *     `manifest_id` primary key) with no behavioural downside.
+ *  4. anti-replay         — atomic `consumeTgDecisionAnyServer` /
+ *     `consumeTgDecision` (`WHERE status = 'PENDING'`); a second tap on the
+ *     same callback is a no-op here either way.
  *  5. answerCallbackQuery — always called, so the tap's spinner clears.
  *  6. editMessageReplyMarkup — removes the buttons after ANY decision is
  *     recorded, so a second tap has nothing left to press.
@@ -345,12 +353,22 @@ export async function handleWebhook(
 
   // (3) + (4): callback_data only ADDRESSES the manifest; the atomic UPDATE
   // is what actually decides + closes the replay race, in one statement.
-  // Server-agnostic on purpose: this ONE webhook (owned by whichever server
-  // has TG_WEBHOOK_OWNER=true) services approval buttons for EVERY server
-  // sharing this bot token, so `cfg.server` (always "$self") is the WRONG
-  // filter here — the manifest being decided may belong to any of them.
-  // Safe because `manifest_id` is globally unique (tg_approvals' PRIMARY KEY).
-  const consumed = await store.consumeTgDecisionAnyServer(manifestId, decision);
+  //
+  // `cfg.ownBot` (TG_BOT_TOKEN_OVERRIDE) selects which store call is safe to
+  // use here:
+  //   - false (default, backward-compatible): server-agnostic on purpose —
+  //     this ONE webhook (owned by whichever server has TG_WEBHOOK_OWNER=
+  //     true) services approval buttons for EVERY server sharing this bot
+  //     token, so `cfg.server` (always "$self") would be the WRONG filter —
+  //     the manifest being decided may belong to any of them. Safe because
+  //     `manifest_id` is globally unique (tg_approvals' PRIMARY KEY).
+  //   - true: this webhook belongs to exactly this server's own bot, so the
+  //     server-scoped `consumeTgDecision(manifestId, cfg.server, decision)`
+  //     is used instead — same atomic one-shot contract, plus an extra
+  //     `server` filter that can only ever match this process's own rows.
+  const consumed = cfg.ownBot
+    ? await store.consumeTgDecision(manifestId, cfg.server, decision)
+    : await store.consumeTgDecisionAnyServer(manifestId, decision);
 
   if (consumed) {
     // (6) Remove the buttons -- best-effort, never blocks the decision itself.
@@ -373,32 +391,48 @@ export async function handleWebhook(
 
 /**
  * Registers the webhook URL with Telegram at startup. No-op when the feature
- * is disabled, OR when this process is not the designated webhook owner
- * (`TG_WEBHOOK_OWNER`, see below). Logs the effective URL (or a failure)
- * loudly: TWO servers calling `setWebhook` for the SAME bot token silently
- * overwrite each other -- a log line here is the only place a deployer can
- * catch that before approvals start vanishing.
+ * is disabled, OR when this process is neither the designated shared-bot
+ * webhook owner (`TG_WEBHOOK_OWNER`) NOR running its own bot
+ * (`TG_BOT_TOKEN_OVERRIDE`, `cfg.ownBot` — see below). Logs the effective URL
+ * (or a failure) loudly: TWO servers calling `setWebhook` for the SAME bot
+ * token silently overwrite each other -- a log line here is the only place a
+ * deployer can catch that before approvals start vanishing.
  *
- * ONE Telegram bot (`@maksim_mcp_approval_bot`) is now shared across all 6 of
- * Maksim's MCP servers (gmail/sheets/calendar/docs/drive-mcp + ticktick-mcp);
- * only ONE of them may physically own the webhook, since Telegram routes
- * every update for a bot token to whichever URL the LAST `setWebhook` call
- * registered. The self-guard below (checked HERE, not only at the call site
- * in http.ts) is deliberate defense-in-depth: this function is meant to be
- * copied byte-for-byte to the other 5 repos (same discipline as the rest of
- * this module, see the file's top doc-comment) -- if a future call site in
- * one of those copies forgets to gate the call externally, this function
- * still refuses to register a second webhook on its own.
+ * ONE Telegram bot (`@maksim_mcp_approval_bot`) is shared by default across
+ * all 6 of Maksim's MCP servers (gmail/sheets/calendar/docs/drive-mcp +
+ * ticktick-mcp); only ONE of them may physically own that shared webhook,
+ * since Telegram routes every update for a bot token to whichever URL the
+ * LAST `setWebhook` call registered. The self-guard below (checked HERE, not
+ * only at the call site in http.ts) is deliberate defense-in-depth: this
+ * function is meant to be copied byte-for-byte to the other 5 repos (same
+ * discipline as the rest of this module, see the file's top doc-comment) --
+ * if a future call site in one of those copies forgets to gate the call
+ * externally, this function still refuses to register a second webhook on
+ * its own.
+ *
+ * `TG_BOT_TOKEN_OVERRIDE` (`cfg.ownBot`) is the backward-compatible opt-out of
+ * that whole sharing arrangement: when set, THIS server's bot token is unique
+ * to it, so there is no fleet-wide collision to avoid, and this function
+ * registers its own webhook regardless of `webhookOwner`. Unset (default),
+ * behaviour is bit-for-bit identical to before this flag existed.
  */
 export async function registerWebhook(cfg: TgApprovalConfig): Promise<void> {
   if (!cfg.enabled) return;
-  if (!cfg.webhookOwner) {
+  // `cfg.ownBot` (TG_BOT_TOKEN_OVERRIDE, config.ts) is the backward-compatible
+  // escape hatch: a server with its own bot token has nothing to collide with
+  // -- there is no OTHER server sharing that exact token that could have its
+  // setWebhook call silently overwritten -- so it registers regardless of
+  // `webhookOwner`. Unset (the default), this branch never fires and the
+  // function behaves bit-for-bit as before this flag existed.
+  if (!cfg.webhookOwner && !cfg.ownBot) {
     console.error(
-      `TG approval: TG_APPROVAL_ENABLED=true but TG_WEBHOOK_OWNER is not "true" -- this server will ` +
-        `NOT call setWebhook and will not receive Telegram button taps. When one bot token is shared ` +
-        `across several MCP servers, exactly ONE of them must set TG_WEBHOOK_OWNER=true; every other ` +
-        `server must leave it unset (default false), or their setWebhook calls will silently overwrite ` +
-        `each other and approvals for whichever server registered last will stop reaching anyone.`,
+      `TG approval: TG_APPROVAL_ENABLED=true but TG_WEBHOOK_OWNER is not "true" (and TG_BOT_TOKEN_OVERRIDE ` +
+        `is not set) -- this server will NOT call setWebhook and will not receive Telegram button taps. ` +
+        `When one bot token is shared across several MCP servers, exactly ONE of them must set ` +
+        `TG_WEBHOOK_OWNER=true; every other server must leave it unset (default false), or their ` +
+        `setWebhook calls will silently overwrite each other and approvals for whichever server ` +
+        `registered last will stop reaching anyone. Alternatively, give this server its own bot via ` +
+        `TG_BOT_TOKEN_OVERRIDE -- then it owns its own webhook independently and this guard doesn't apply.`,
     );
     return;
   }

@@ -160,6 +160,7 @@ function tgCfg(overrides = {}) {
     toolsAllowlist: null,
     ttlMs: 3_600_000,
     webhookOwner: false, // drive-mcp никогда не владеет вебхуком в проде — см. server.ts
+    ownBot: false, // TG_BOT_TOKEN_OVERRIDE не задан — дефолт, полная обратная совместимость
     ...overrides,
   };
 }
@@ -449,6 +450,96 @@ console.log("\n[10] registerWebhook: TG_WEBHOOK_OWNER не установлен/
   // подтверждает, что guard не сломал сам happy-path, а именно гейтит его.
   await registerWebhook(tgCfg({ enabled: true, webhookOwner: true }));
   check("webhookOwner=true → setWebhook ВЫЗВАН ровно один раз", tgCalls.filter((c) => c.method === "setWebhook").length === 1);
+}
+
+// ═══ [11] registerWebhook: TG_BOT_TOKEN_OVERRIDE (ownBot) — свой бот регистрирует
+// СВОЙ вебхук независимо от webhookOwner ═══
+// Доказывает оба требования задачи: (a) обратная совместимость — ownBot=false
+// (override не задан) ведёт себя ровно как секция [10]; (b) ownBot=true даёт
+// точно такой же эффект на registerWebhook, как webhookOwner=true, БЕЗ того,
+// чтобы webhookOwner вообще был установлен — то есть флаг работает сам по себе,
+// не требуя менять существующий webhookOwner-гейт.
+console.log("\n[11] registerWebhook: TG_BOT_TOKEN_OVERRIDE=true (ownBot) регистрирует вебхук, даже когда webhookOwner=false");
+{
+  const { mock } = resetTelegramMocks();
+  mock("setWebhook", () => ({ statusCode: 200, data: { ok: true, result: true }, headers: { "content-type": "application/json" } }));
+
+  // (a) обратная совместимость: ownBot не задан (false) + webhookOwner не задан → как в [10](a), НЕ регистрирует.
+  await registerWebhook(tgCfg({ enabled: true }));
+  check("ownBot=false (default), webhookOwner=false → setWebhook НЕ вызван (регресс на [10] не сломан)", tgCalls.filter((c) => c.method === "setWebhook").length === 0);
+
+  // (b) флаг сам по себе: ownBot=true, webhookOwner ОСТАЁТСЯ false → всё равно регистрирует.
+  await registerWebhook(tgCfg({ enabled: true, webhookOwner: false, ownBot: true }));
+  check(
+    "ownBot=true, webhookOwner=false → setWebhook ВСЁ РАВНО вызван (свой бот не нуждается в webhookOwner)",
+    tgCalls.filter((c) => c.method === "setWebhook").length === 1,
+  );
+}
+
+// ═══ [12] handleWebhook: TG_BOT_TOKEN_OVERRIDE (ownBot) переключает consume
+// на server-scoped `consumeTgDecision`, а не fleet-wide `consumeTgDecisionAnyServer` ═══
+// Зеркало секции [9], но с обратным ожиданием: там (ownBot=false, дефолт)
+// вебхук консюмит approval ЧУЖОГО сервера, потому что общий бот обслуживает
+// весь флот. Здесь (ownBot=true) — этот вебхук принадлежит ИСКЛЮЧИТЕЛЬНО
+// этому серверу, так что approval с чужим `server` НЕ должен решаться.
+console.log("\n[12] handleWebhook с ownBot=true: server-scoped consume — approval ЧУЖОГО сервера НЕ решается, approval СВОЕГО — решается");
+{
+  const { mock } = resetTelegramMocks();
+  mock("answerCallbackQuery", () => ({ statusCode: 200, data: { ok: true }, headers: { "content-type": "application/json" } }));
+  mock("editMessageReplyMarkup", () => ({ statusCode: 200, data: { ok: true }, headers: { "content-type": "application/json" } }));
+
+  const cfg = tgCfg({ server: "drive", ownBot: true });
+  const tgStore = makeTgStore();
+
+  // Approval, принадлежащий ДРУГОМУ серверу (как в [9]) — с ownBot=true этот
+  // вебхук НЕ должен его трогать: он никогда не разделяет бот-токен с
+  // calendar-mcp, значит callback с этим manifest_id физически не мог прийти
+  // от кнопки calendar-mcp прислал(а) — но даже если бы пришёл, server-scoped
+  // consume обязан отказать.
+  await tgStore.createTgApproval({
+    manifestId: "m-own-bot-foreign",
+    server: "calendar",
+    chatId: cfg.ownerChatId,
+    messageId: 77,
+    createdAt: now(),
+    expiresAt: now() + 3_600_000,
+  });
+  await handleWebhook(cfg, tgStore, {
+    callback_query: {
+      id: "cbq-own-bot-foreign",
+      from: { id: Number(cfg.ownerChatId) },
+      data: "a:m-own-bot-foreign",
+      message: { message_id: 77, chat: { id: cfg.ownerChatId } },
+    },
+  });
+  check(
+    "ownBot=true: approval ЧУЖОГО сервера (calendar) остался PENDING — server-scoped consume отказал",
+    tgStore.approvals.get("m-own-bot-foreign").status === "PENDING",
+    JSON.stringify(tgStore.approvals.get("m-own-bot-foreign")),
+  );
+
+  // Approval, принадлежащий ЭТОМУ серверу — должен решиться нормально (happy path не сломан).
+  await tgStore.createTgApproval({
+    manifestId: "m-own-bot-mine",
+    server: "drive",
+    chatId: cfg.ownerChatId,
+    messageId: 78,
+    createdAt: now(),
+    expiresAt: now() + 3_600_000,
+  });
+  await handleWebhook(cfg, tgStore, {
+    callback_query: {
+      id: "cbq-own-bot-mine",
+      from: { id: Number(cfg.ownerChatId) },
+      data: "a:m-own-bot-mine",
+      message: { message_id: 78, chat: { id: cfg.ownerChatId } },
+    },
+  });
+  check(
+    "ownBot=true: approval СВОЕГО сервера (drive) решился APPROVED",
+    tgStore.approvals.get("m-own-bot-mine").status === "APPROVED",
+    JSON.stringify(tgStore.approvals.get("m-own-bot-mine")),
+  );
 }
 
 // ── итог ─────────────────────────────────────────────────────────────────

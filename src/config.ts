@@ -350,7 +350,7 @@ export function loadConsentGateConfig(): ConsentGateConfig {
 export interface TgApprovalConfig {
   /** Env TG_APPROVAL_ENABLED, default false. */
   enabled: boolean;
-  /** Env TG_BOT_TOKEN. Required when enabled. */
+  /** Env TG_BOT_TOKEN_OVERRIDE || TG_BOT_TOKEN. Required when enabled. */
   botToken: string;
   /** Env TG_OWNER_CHAT_ID — the only chat id the webhook accepts callbacks from. */
   ownerChatId: string;
@@ -382,11 +382,34 @@ export interface TgApprovalConfig {
    * self-guards on this field (defense-in-depth beyond the call-site check).
    */
   webhookOwner: boolean;
+  /**
+   * Env TG_BOT_TOKEN_OVERRIDE, default false (`!!process.env.TG_BOT_TOKEN_OVERRIDE`).
+   * Single feature-flag switch for "this server gets its OWN Telegram bot
+   * instead of sharing the fleet-wide TG_BOT_TOKEN". When true:
+   *   - `botToken` above resolves to TG_BOT_TOKEN_OVERRIDE, not the shared
+   *     TG_BOT_TOKEN — this server talks to its own bot's Telegram API.
+   *   - `registerWebhook` (tg_approval.ts) registers `/tg/webhook` even
+   *     though `webhookOwner` is false — there's no fleet-wide collision to
+   *     avoid any more, this server's bot token is unique to it.
+   *   - the `/tg/webhook` route (http.ts) stops 404-ing even though
+   *     `webhookOwner` is false, for the same reason.
+   *   - `handleWebhook` (tg_approval.ts) decides callbacks through the
+   *     server-scoped `store.consumeTgDecision(manifestId, cfg.server, …)`
+   *     instead of the fleet-wide `consumeTgDecisionAnyServer` — safe (and
+   *     correct) again once this webhook is known to belong to exactly one
+   *     server's own bot, rather than being shared across all 6.
+   * Unset (default false): every one of the above behaves EXACTLY as before
+   * this flag existed — full backward compatibility, no new deploy required
+   * to roll back, just unset the env var. See `loadTgApprovalConfig` below.
+   */
+  ownBot: boolean;
 }
 
 export function loadTgApprovalConfig(consentServer: string): TgApprovalConfig {
   const enabled = process.env.TG_APPROVAL_ENABLED?.trim().toLowerCase() === "true";
-  const botToken = process.env.TG_BOT_TOKEN?.trim() || "";
+  const botTokenOverride = process.env.TG_BOT_TOKEN_OVERRIDE?.trim() || "";
+  const botToken = botTokenOverride || process.env.TG_BOT_TOKEN?.trim() || "";
+  const ownBot = !!botTokenOverride;
   const ownerChatId = process.env.TG_OWNER_CHAT_ID?.trim() || "";
   const webhookSecret = process.env.TG_APPROVAL_WEBHOOK_SECRET?.trim() || "";
   const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN?.trim();
@@ -409,7 +432,7 @@ export function loadTgApprovalConfig(consentServer: string): TgApprovalConfig {
   // feature or serve mutations without the second factor it claims to enforce.
   if (enabled && (!botToken || !ownerChatId || !webhookSecret || !publicBaseUrl)) {
     const missing = [
-      !botToken && "TG_BOT_TOKEN",
+      !botToken && "TG_BOT_TOKEN (or TG_BOT_TOKEN_OVERRIDE)",
       !ownerChatId && "TG_OWNER_CHAT_ID",
       !webhookSecret && "TG_APPROVAL_WEBHOOK_SECRET",
       !publicBaseUrl && "PUBLIC_BASE_URL (or RAILWAY_PUBLIC_DOMAIN)",
@@ -432,6 +455,7 @@ export function loadTgApprovalConfig(consentServer: string): TgApprovalConfig {
     toolsAllowlist,
     ttlMs,
     webhookOwner,
+    ownBot,
   };
 }
 

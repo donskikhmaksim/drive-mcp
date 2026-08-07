@@ -23,6 +23,13 @@
  * deployed state; owner=true is the regression control proving the guard
  * actually gates something, not just always-404s).
  *
+ * Scenario [d] adds TG_BOT_TOKEN_OVERRIDE (own-bot mode, `config.ts`'s
+ * `ownBot`): a server given its own bot token must serve `/tg/webhook`
+ * regardless of `webhookOwner`, since it no longer shares a token (and thus
+ * a webhook URL collision risk) with any other server. Scenarios [a]-[c] are
+ * untouched and must still pass bit-for-bit -- they are the backward-
+ * compatibility proof that leaving TG_BOT_TOKEN_OVERRIDE unset changes nothing.
+ *
  * Why this file spawns two CHILD PROCESSES instead of just calling
  * `startHttpServer` twice with different config objects: unlike
  * `requireAuth`, `TG_WEBHOOK_OWNER` is NOT threaded through the `Config`
@@ -145,7 +152,7 @@ function runOrchestrator() {
     if (!cond) failures++;
   };
 
-  function spawnScenario(scenario, port, webhookOwnerEnv) {
+  function spawnScenario(scenario, port, webhookOwnerEnv, extraEnv = {}) {
     const result = spawnSync(process.execPath, [THIS_FILE], {
       encoding: "utf8",
       env: {
@@ -159,6 +166,7 @@ function runOrchestrator() {
         PUBLIC_BASE_URL: "https://example.test",
         ...(webhookOwnerEnv === null ? {} : { TG_WEBHOOK_OWNER: webhookOwnerEnv }),
         DATABASE_URL: "",
+        ...extraEnv,
       },
       timeout: 15_000,
     });
@@ -226,6 +234,33 @@ function runOrchestrator() {
         r,
       );
       check("registerWebhook по-прежнему вызывает setWebhook ровно один раз при старте (happy path не сломан)", r.setWebhookCalls === 1, r.setWebhookCalls);
+    }
+  }
+
+  // ═══ [d] TG_BOT_TOKEN_OVERRIDE (ownBot): webhookOwner ОСТАЁТСЯ false/unset,
+  // но своя копия бота всё равно отвечает 200 и handler реально вызывается —
+  // доказывает, что флаг сам по себе достаточен, независимо от webhookOwner ═══
+  console.log("\n[d] TG_BOT_TOKEN_OVERRIDE задан (ownBot), webhookOwner НЕ задан + верный секрет → 200, handler ВЫЗЫВАЕТСЯ");
+  {
+    const r = spawnScenario("owner-false-own-bot", 35063, null, { TG_BOT_TOKEN_OVERRIDE: BOT_TOKEN });
+    check("worker завершился и вернул результат", !!r, "worker crashed or printed no JSON");
+    if (r) {
+      check("статус 200 (own-bot путь не гейтится webhookOwner)", r.status === 200, r.status);
+      check(
+        "handleWebhook РЕАЛЬНО вызывался ровно один раз (ровно одна строка 'TG approval webhook error:')",
+        r.handlerErrorLineCount === 1,
+        r.handlerErrorLineCount,
+      );
+      check(
+        "вызов дошёл до store.consumeTgDecision (упал на 'Store not initialised', а не раньше)",
+        r.reachedStoreNotInitialised === true,
+        r,
+      );
+      check(
+        "registerWebhook вызывает setWebhook ровно один раз при старте, несмотря на webhookOwner=false (ownBot достаточен сам по себе)",
+        r.setWebhookCalls === 1,
+        r.setWebhookCalls,
+      );
     }
   }
 
