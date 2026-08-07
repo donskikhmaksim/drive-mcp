@@ -5,7 +5,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { docs_v1 } from "googleapis";
-import { ok, fail, guard, safeText } from "../util.js";
+import { ok, fail, guard, safeText, humanReadableAutoExecuteReport } from "../util.js";
 import { accountField, type UserClients } from "../accounts.js";
 import type { GoogleClients } from "../google.js";
 import {
@@ -324,7 +324,7 @@ async function executeCreateDocCore(
   return buildMutationResult({
     results: [created],
     total: 1,
-    verb: "Created",
+    verb: "Создано",
     summaryIcon: "📄",
     verify: (r) => postVerifyDocIdentity(g, r.documentId, r.title ?? payload.title),
     reportTitle: "Независимая проверка создания документа",
@@ -355,7 +355,7 @@ async function executeAppendTextCore(
   return buildMutationResult({
     results: [result],
     total: 1,
-    verb: "Appended",
+    verb: "Добавлено",
     summaryIcon: "📝",
     verify: (r) => postVerifyTextContains(g, r.documentId, payload.text, r.title ?? r.documentId),
     reportTitle: "Независимая проверка добавления текста",
@@ -389,7 +389,7 @@ async function executeInsertTextCore(
   return buildMutationResult({
     results: [result],
     total: 1,
-    verb: "Inserted",
+    verb: "Вставлено",
     summaryIcon: "📝",
     verify: (r) => postVerifyTextContains(g, r.documentId, payload.text, r.title ?? r.documentId),
     reportTitle: "Независимая проверка вставки текста",
@@ -438,7 +438,7 @@ async function executeReplaceTextCore(
   return buildMutationResult({
     results: [result],
     total: 1,
-    verb: "Replaced",
+    verb: "Заменено",
     summaryIcon: "🔄",
     verify: (r) => postVerifyReplaced(g, r.documentId, payload.find, payload.replace, r.title ?? r.documentId),
     reportTitle: "Независимая проверка замены текста",
@@ -467,7 +467,7 @@ async function executeRawBatchUpdateCore(
   return buildMutationResult({
     results: [result],
     total: 1,
-    verb: "Applied",
+    verb: "Применено",
     summaryIcon: "⚙️",
     verify: (r) => postVerifyRawBatchApplied(g, r.documentId),
     reportTitle: "Независимая проверка raw batchUpdate",
@@ -475,16 +475,6 @@ async function executeRawBatchUpdateCore(
     consentStore,
     auditId,
   });
-}
-
-/** Extracts the human-readable text from a CallToolResult — the same text the
- * model would have seen in chat, used for the Telegram auto-execution report
- * (see autoExecute.ts's `ExecuteFn` doc-comment). If a tool's success payload
- * carries a link (e.g. docs_create's webViewLink), it lives inside this text
- * because `util.ts`'s `ok()` JSON.stringifies non-string data into it. */
-function extractText(result: CallToolResult): string {
-  const first = result.content?.[0];
-  return first && first.type === "text" ? first.text : JSON.stringify(result);
 }
 
 // ── Auto-execute registrations (module scope — see doc-comment on
@@ -496,7 +486,7 @@ registerAutoExecutor("docs_create", {
     const p = payload as CreateDocPayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeCreateDocCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return humanReadableAutoExecuteReport(result);
   },
 });
 
@@ -506,7 +496,7 @@ registerAutoExecutor("docs_append_text", {
     const p = payload as AppendTextPayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeAppendTextCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return humanReadableAutoExecuteReport(result);
   },
 });
 
@@ -516,7 +506,7 @@ registerAutoExecutor("docs_insert_text", {
     const p = payload as InsertTextPayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeInsertTextCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return humanReadableAutoExecuteReport(result);
   },
 });
 
@@ -526,7 +516,7 @@ registerAutoExecutor("docs_replace_text", {
     const p = payload as ReplaceTextPayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeReplaceTextCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return humanReadableAutoExecuteReport(result);
   },
 });
 
@@ -536,7 +526,7 @@ registerAutoExecutor("docs_raw_batch_update", {
     const p = payload as RawBatchUpdatePayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeRawBatchUpdateCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return humanReadableAutoExecuteReport(result);
   },
 });
 

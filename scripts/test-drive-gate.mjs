@@ -159,7 +159,7 @@ console.log("\n[1] drive_rename: full plan→confirm round trip, mutation lands,
 
   const execResp = await cli.callTool({ name: "drive_rename", arguments: { manifest_id: manifestId, user_reply: "да, переименуй" } });
   const execBody = text(execResp);
-  check("execute succeeds — summary shows 1/1, no error", execBody.includes('"summary": "✏️ Renamed 1/1"'), execBody.slice(0, 60));
+  check("execute succeeds — summary shows 1/1, no error", execBody.includes('"summary": "✏️ Переименовано 1/1"'), execBody.slice(0, 60));
   check("world IS mutated", world.files.get("F1").name === "final-report.pdf");
   check("post-verify report attached with ✅", execBody.includes("Независимая проверка переименования") && execBody.includes("✅"));
 }
@@ -217,7 +217,7 @@ console.log("\n[4] drive_share: plan→confirm→grant, post-verify re-reads LIV
 
   const execResp = await cli.callTool({ name: "drive_share", arguments: { manifest_id: manifestId, user_reply: "да, дай доступ" } });
   const execBody = text(execResp);
-  check("execute succeeds", execBody.includes('"summary": "✅ Shared 1/1"'), execBody.slice(0, 60));
+  check("execute succeeds", execBody.includes('"summary": "✅ Открыт доступ 1/1"'), execBody.slice(0, 60));
   check("world IS shared", world.permissions.get("F1").some((p) => p.emailAddress === "eric@x.com" && p.role === "reader"));
   check("post-verify report present with ✅", execBody.includes("Независимая проверка открытия доступа") && execBody.includes("✅"));
   check("post-verify text references live permissions, not just the create() echo", execBody.includes("permissions"));
@@ -259,7 +259,7 @@ console.log("\n[6] drive_unshare: plan→confirm→revoke, post-verify confirms 
 
   const execResp = await cli.callTool({ name: "drive_unshare", arguments: { manifest_id: manifestId, user_reply: "да, убери" } });
   const execBody = text(execResp);
-  check("execute succeeds", execBody.includes('"summary": "🔒 Removed 1/1"'), execBody.slice(0, 60));
+  check("execute succeeds", execBody.includes('"summary": "🔒 Отозван доступ 1/1"'), execBody.slice(0, 60));
   check("permission gone from world", world.permissions.get("F1").length === 0);
   check("post-verify confirms removal against live permissions", execBody.includes("✅") && execBody.includes("Независимая проверка отзыва доступа"));
 }

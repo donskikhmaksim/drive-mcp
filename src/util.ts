@@ -20,6 +20,98 @@ export function fail(error: unknown): CallToolResult {
   };
 }
 
+/**
+ * Удаляет служебные инструкции, адресованные МОДЕЛИ (напр. `_[агенту: ...]_` —
+ * `renderVerifyReport`/`renderPlanned` в consent.ts вшивают их в пруф/превью,
+ * прося модель перепечатать блок дословно, а не пересказом). Такие маркеры
+ * легитимны, когда их читает модель внутри обычного MCP tool-response — но
+ * НИКОГДА не должны попасть на глаза человеку напрямую, в канале без
+ * модели-посредника (Telegram auto-execute report — см.
+ * `humanReadableAutoExecuteReport` ниже). `requireConsent()`'s план уже
+ * разделяет эти два канала (`built.preview` в Telegram — чистый, `renderPlanned()`
+ * с хвостом — только в MCP-ответе модели); эта функция даёт репорту после
+ * исполнения ту же гарантию.
+ */
+function stripAgentInstructions(s: string): string {
+  return s.replace(/\n{0,2}_\[агенту:[^\n]*\]_\n*/gi, "\n").trim();
+}
+
+/** Один буллет на объект результата (`references/output-format.md` §7.1 п.2:
+ * названием, жирным, не id). Форма `results[]` у каждого write-тула разная
+ * (name/newName/fileId/webViewLink/downloadUrl/…) — это намеренно generic
+ * reflection по общим полям, а не N хардкодов под каждый инструмент, иначе
+ * список расходился бы с `buildMutationResult` при каждом новом тул. Внешний
+ * текст (имя, текст ошибки) идёт через `safeText` — те же правила
+ * инъекции-в-markdown, что уже применяются к post-verify строкам
+ * (`references/security-checklist.md` §1). */
+function autoExecuteResultLine(item: unknown): string {
+  if (typeof item !== "object" || item === null) {
+    return `- ${safeText(String(item), 160)}`;
+  }
+  const r = item as Record<string, unknown>;
+  const nameRaw = r.name ?? r.newName ?? r.fileId ?? r.id;
+  const label = safeText(nameRaw != null ? String(nameRaw) : "", 80) || "объект";
+  if (typeof r.error === "string" && r.error) {
+    return `- ❌ **«${label}»** — ${safeText(r.error, 160)}`;
+  }
+  const link = [r.webViewLink, r.downloadUrl, r.uploadUrl].find(
+    (v): v is string => typeof v === "string" && v.length > 0,
+  );
+  // Обычный URL как ПРОСТОЙ ТЕКСТ, не markdown-ссылка `[текст](url)`:
+  // `mdToTelegramHtml` (tg_approval.ts) не умеет её парсить, а Telegram сам
+  // авто-детектит и делает кликабельным любой http(s)-URL прямо в тексте
+  // сообщения — без риска, что `&`/`?`/`=` в query-строке Google сломают
+  // самодельный markdown-парсер ссылок.
+  return link ? `- ✅ **«${label}»** — ${link}` : `- ✅ **«${label}»**`;
+}
+
+/**
+ * Строит финальный человекочитаемый Markdown-отчёт для доставки НАПРЯМУЮ в
+ * Telegram после автоисполнения по кнопке (`http.ts`'s `runAutoExecutePoller`
+ * → `tg_approval.ts`'s `reportAutoExecutionResult`) — канал БЕЗ
+ * модели-посредника. В обычном (не-авто) MCP-ответе тот же `CallToolResult`
+ * несёт `JSON.stringify(structuredContent)` в text-контенте, и МОДЕЛЬ сама
+ * парсит JSON и пересказывает человеку по формату `references/output-format.md`;
+ * здесь модели нет вообще, так что ту же работу форматирования должен
+ * проделать сервер вручную — тем же единым каркасом §7.1 (заголовок → объекты
+ * → пруф), одним хелпером на репозиторий (drive.ts/docs.ts/skill_version.ts
+ * раньше держали три идентичные копии `extractText()`, которые ошибочно
+ * считали `first.text` уже готовым для человека текстом и просто отдавали его
+ * как есть — а это всегда JSON, потому что `ok()` кладёт туда
+ * `JSON.stringify(data, null, 2)` для любых нестроковых данных).
+ */
+export function humanReadableAutoExecuteReport(result: CallToolResult): string {
+  const first = result.content?.[0];
+  const raw = first && first.type === "text" ? first.text : "";
+  if (!raw) return "🛑 Не удалось сформировать отчёт об исполнении.";
+
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    // Не JSON — ok() уже отдал готовую строку целиком (например текст ошибки
+    // автоисполнения из http.ts's runAutoExecutePoller catch-блока). Только
+    // на всякий случай вырезаем служебные инструкции — defense in depth.
+    return stripAgentInstructions(raw);
+  }
+  if (typeof data !== "object" || data === null || Array.isArray(data)) {
+    return stripAgentInstructions(raw);
+  }
+
+  const d = data as { summary?: unknown; results?: unknown; verification?: unknown };
+  const blocks: string[] = [];
+  if (typeof d.summary === "string" && d.summary) {
+    blocks.push(`### ${d.summary}`);
+  }
+  if (Array.isArray(d.results) && d.results.length) {
+    blocks.push(d.results.map((item) => autoExecuteResultLine(item)).join("\n"));
+  }
+  if (typeof d.verification === "string" && d.verification) {
+    blocks.push(stripAgentInstructions(d.verification));
+  }
+  return blocks.length ? blocks.join("\n\n") : stripAgentInstructions(raw);
+}
+
 /** Wraps a tool handler so thrown errors become structured MCP error results. */
 export function guard<A>(
   fn: (args: A) => Promise<CallToolResult>,

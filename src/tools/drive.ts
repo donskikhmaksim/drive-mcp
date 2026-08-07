@@ -6,7 +6,7 @@ import { z } from "zod";
 import { Readable } from "node:stream";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { ok, fail, guard, isTextual, safeText, mapWithLimit } from "../util.js";
+import { ok, fail, guard, isTextual, safeText, mapWithLimit, humanReadableAutoExecuteReport } from "../util.js";
 import { accountField, type UserClients } from "../accounts.js";
 import type { GoogleClients } from "../google.js";
 import { documentToPlainText } from "./docs.js";
@@ -560,13 +560,6 @@ function withExportExtension(name: string, exportMime: string): string {
 // логики), и зарегистрировано в реестре, чтобы фоновый поллер мог исполнить
 // его напрямую, в обход модели.
 
-/** Достаёт человекочитаемый текст из CallToolResult — тот же текст, что
- * увидела бы модель, для отчёта в Telegram (см. autoExecute.ts's ExecuteFn). */
-function extractText(result: CallToolResult): string {
-  const first = result.content?.[0];
-  return first && first.type === "text" ? first.text : JSON.stringify(result);
-}
-
 // ── drive_create_folder ──────────────────────────────────────────────────
 // Degenerate binding (a not-yet-existing folder has no live object to bind
 // against) — same rehash on both the manual (chat) and auto (TG button)
@@ -591,8 +584,9 @@ export interface CreateFolderPayload {
  *
  * Максим явно спрашивал про этот сценарий («создалась папка → где в
  * Telegram будет ссылка»): `webViewLink` идёт в `results` внутри
- * `buildMutationResult`, и `ok()` сериализует его через JSON.stringify — так
- * что `extractText()` в конце вернёт текст, где ссылка присутствует.
+ * `buildMutationResult`, и `humanReadableAutoExecuteReport()` (util.ts)
+ * достаёт его оттуда и печатает кликабельным URL-ом рядом с именем объекта —
+ * а не как сырой JSON, где раньше ссылка тонула в `\"webViewLink\": \"...\"`.
  */
 async function executeCreateFolderCore(
   g: GoogleClients,
@@ -624,7 +618,7 @@ async function executeCreateFolderCore(
   return buildMutationResult({
     results,
     total: payload.folders.length,
-    verb: "Created",
+    verb: "Создано",
     summaryIcon: "📁",
     verify: (r) => postVerifyFileIdentity(g, r.id ?? "", r.name, r.name),
     reportTitle: "Независимая проверка создания папок",
@@ -640,7 +634,7 @@ registerAutoExecutor("drive_create_folder", {
     const p = payload as CreateFolderPayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeCreateFolderCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return humanReadableAutoExecuteReport(result);
   },
 });
 
@@ -698,7 +692,7 @@ async function executeRenameCore(
   return buildMutationResult({
     results,
     total: payload.items.length,
-    verb: "Renamed",
+    verb: "Переименовано",
     summaryIcon: "✏️",
     verify: (r) =>
       postVerifyFileIdentity(g, r.fileId, r.newName, r.oldName ? `${r.oldName} → ${r.newName}` : r.newName),
@@ -719,7 +713,7 @@ registerAutoExecutor("drive_rename", {
     const p = payload as RenamePayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeRenameCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return humanReadableAutoExecuteReport(result);
   },
 });
 
@@ -817,7 +811,7 @@ async function executeMoveCore(
   return buildMutationResult({
     results,
     total: payload.items.length,
-    verb: "Moved",
+    verb: "Перемещено",
     summaryIcon: "📂",
     verify: (r) => {
       const item = payload.items.find((it) => it.fileId === r.fileId);
@@ -843,7 +837,7 @@ registerAutoExecutor("drive_move", {
     const p = payload as MovePayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeMoveCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return humanReadableAutoExecuteReport(result);
   },
 });
 
@@ -900,7 +894,7 @@ async function executeTrashCore(
   return buildMutationResult({
     results,
     total: payload.fileIds.length,
-    verb: "Trashed",
+    verb: "Удалено в Корзину",
     summaryIcon: "🗑",
     verify: (r) => {
       const label = r.name ?? preSnapshot.find((s) => s.fileId === r.fileId)?.name ?? r.fileId;
@@ -924,7 +918,7 @@ registerAutoExecutor("drive_trash", {
     const p = payload as TrashPayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeTrashCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return humanReadableAutoExecuteReport(result);
   },
 });
 
@@ -981,7 +975,7 @@ async function executeUploadFileCore(
   return buildMutationResult({
     results,
     total: payload.files.length,
-    verb: "Uploaded",
+    verb: "Загружено",
     summaryIcon: "⬆️",
     verify: (r) => postVerifyFileIdentity(g, r.id ?? "", r.name, r.name),
     reportTitle: "Независимая проверка загрузки",
@@ -997,7 +991,7 @@ registerAutoExecutor("drive_upload_file", {
     const p = payload as UploadFilePayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeUploadFileCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return humanReadableAutoExecuteReport(result);
   },
 });
 
@@ -1160,7 +1154,7 @@ async function executeUploadSessionCore(
   return buildMutationResult({
     results,
     total: payload.files.length,
-    verb: "Created session(s) for",
+    verb: "Создано сессий загрузки",
     summaryIcon: "⬆️",
     verify: async (r) =>
       r.uploadUrl
@@ -1186,7 +1180,7 @@ registerAutoExecutor("drive_create_upload_session", {
     const p = payload as UploadSessionPayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeUploadSessionCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return humanReadableAutoExecuteReport(result);
   },
 });
 
@@ -1262,7 +1256,7 @@ async function executeOverwriteCore(
   return buildMutationResult({
     results,
     total: payload.files.length,
-    verb: "Overwrote",
+    verb: "Перезаписано",
     summaryIcon: "♻️",
     verify: (r) => {
       const before = preSnapshot.find((s) => s.fileId === r.fileId) ?? null;
@@ -1286,7 +1280,7 @@ registerAutoExecutor("drive_overwrite_file", {
     const p = payload as OverwritePayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeOverwriteCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return humanReadableAutoExecuteReport(result);
   },
 });
 
@@ -1398,7 +1392,7 @@ async function executeShareCore(
   return buildMutationResult({
     results,
     total: payload.items.length,
-    verb: "Shared",
+    verb: "Открыт доступ",
     summaryIcon: "✅",
     verify: (r) =>
       postVerifyPermissionGranted(
@@ -1439,7 +1433,7 @@ async function executeUnshareCore(
   return buildMutationResult({
     results,
     total: payload.items.length,
-    verb: "Removed",
+    verb: "Отозван доступ",
     summaryIcon: "🔒",
     verify: (r) => postVerifyPermissionRemoved(g, r.fileId, r.permissionId, r.name ?? r.fileId),
     reportTitle: "Независимая проверка отзыва доступа",
@@ -1459,7 +1453,7 @@ registerAutoExecutor("drive_share", {
     const p = payload as SharePayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeShareCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return humanReadableAutoExecuteReport(result);
   },
 });
 
@@ -1473,7 +1467,7 @@ registerAutoExecutor("drive_unshare", {
     const p = payload as UnsharePayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeUnshareCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return humanReadableAutoExecuteReport(result);
   },
 });
 
@@ -1645,7 +1639,7 @@ registerAutoExecutor("drive_get_download_url", {
     const p = payload as DownloadUrlPayload;
     const g = ctx.clients.resolve(p.account);
     const result = await executeGetDownloadUrlCore(g, p, auditId, ctx.consentStore);
-    return extractText(result);
+    return humanReadableAutoExecuteReport(result);
   },
 });
 

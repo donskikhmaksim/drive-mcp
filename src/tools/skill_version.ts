@@ -14,7 +14,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { ok, fail, guard, safeText } from "../util.js";
+import { ok, fail, guard, safeText, humanReadableAutoExecuteReport } from "../util.js";
 import { buildUserClients, type UserClients } from "../accounts.js";
 import { loadConfig } from "../config.js";
 import {
@@ -236,7 +236,7 @@ async function executeSkillVersionCore(
   return buildMutationResult({
     results: [{ newFileId, newFileName: payload.newFileName, skillFolderId, archivedFile, error }],
     total: 1,
-    verb: "Updated",
+    verb: "Обновлено",
     summaryIcon: "✅",
     verify: async (r) => {
       const meta = await g.drive.files
@@ -252,13 +252,6 @@ async function executeSkillVersionCore(
     consentStore,
     auditId,
   });
-}
-
-/** Достаёт человекочитаемый текст из CallToolResult — тот же текст, что
- * увидела бы модель, для отчёта в Telegram (см. autoExecute.ts's ExecuteFn). */
-function extractText(result: CallToolResult): string {
-  const first = result.content?.[0];
-  return first && first.type === "text" ? first.text : JSON.stringify(result);
 }
 
 /** Builds a Google client for the fixed `personal` account WITHOUT a live
@@ -286,7 +279,7 @@ registerAutoExecutor("skill_version_update", {
     const p = payload as SkillVersionPayload;
     const g = ctx.clients.resolve(ACCOUNT);
     const result = await executeSkillVersionCore(p, auditId, ctx.consentStore, g);
-    return extractText(result);
+    return humanReadableAutoExecuteReport(result);
   },
 });
 
