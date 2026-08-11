@@ -365,5 +365,122 @@ console.log("\n[15] интеграция: «not sure» → НЕ confirmed; «о�
   check("«ну не знаю» манифест ЖИВ (AWAITING)", p3.store.manifests.get(id3).status === "AWAITING_CONSENT");
 }
 
+// ── 16. automation_key быстрый путь (ТЗ TZ_automation_key_consent_gate.md) ──
+console.log("\n[16] automation_key: валидный ключ исполняет с первого вызова; невалидный — тихий fallthrough");
+{
+  // (a) checkAutomationKey НЕ передан вовсе — уже покрыто тестами [1]-[15]
+  // выше (ни один из них не передаёт automationKey/checkAutomationKey) —
+  // регресс: побайтовое поведение как раньше. Отдельной проверки не нужно.
+
+  // (b) валидный ключ (мок DI) → confirmed С ПЕРВОГО вызова, без
+  // manifest_id/user_reply, manifestId в решении пустой (плана в БД нет).
+  clock.t = 1_700_000_000_000;
+  {
+    const store = makeStore();
+    const okCheck = async (key) => (key === "GOOD" ? { ok: true, channel: "window:abc123" } : { ok: false });
+    const dec = await requireConsent({
+      tool: "drive_share",
+      accountLabel: "personal",
+      plan,
+      rehash,
+      store,
+      cfg,
+      automationKey: "GOOD",
+      checkAutomationKey: okCheck,
+    });
+    check("kind=confirmed с первого вызова", dec.kind === "confirmed", JSON.stringify(dec).slice(0, 100));
+    check("manifestId пуст — манифест в БД не создавался", dec.kind === "confirmed" && dec.manifestId === "");
+    check("payload из плана", dec.kind === "confirmed" && canonicalJson(dec.payload) === canonicalJson(PAYLOAD));
+    check("ни один манифест не вставлен в store", store.manifests.size === 0);
+    check("аудит-запись есть, actor=automation", store.audits.length === 1 && store.audits[0].actor === "automation");
+    check("аудит несёт метку канала", store.audits[0].checks.automationKey === "window:abc123");
+    check("аудит outcome=confirmed", store.audits[0].outcome === "confirmed");
+  }
+
+  // (c) невалидный/просроченный ключ → НЕ ошибка, тихий fallthrough на
+  // обычный путь (без manifest_id/user_reply рядом — уходит в фазу плана,
+  // как будто automation_key вообще не было; ключ не подсказывается модели).
+  {
+    const store = makeStore();
+    const badCheck = async () => ({ ok: false });
+    const dec = await requireConsent({
+      tool: "drive_share",
+      accountLabel: "personal",
+      plan,
+      rehash,
+      store,
+      cfg,
+      automationKey: "BAD",
+      checkAutomationKey: badCheck,
+    });
+    check("невалидный ключ → kind=planned (обычный путь, НЕ ошибка)", dec.kind === "planned", JSON.stringify(dec).slice(0, 100));
+    check("манифест создан обычным путём", store.manifests.size === 1);
+    check("отказ не упоминает automation_key вообще", !JSON.stringify(dec).toLowerCase().includes("automation"));
+  }
+
+  // (d) rehash разошёлся на automation-пути → отказ, НЕ тихое исполнение.
+  {
+    const store = makeStore();
+    const okCheck = async () => ({ ok: true, channel: "window:xyz" });
+    const changedRehash = () => sha256({ changed: true });
+    const dec = await requireConsent({
+      tool: "drive_share",
+      accountLabel: "personal",
+      plan,
+      rehash: changedRehash,
+      store,
+      cfg,
+      automationKey: "GOOD",
+      checkAutomationKey: okCheck,
+    });
+    check("binding-рассинхрон на automation-пути → refused", dec.kind === "refused", JSON.stringify(dec).slice(0, 100));
+    check("сообщение про изменившееся состояние", dec.kind === "refused" && dec.result.includes("изменилось"));
+    check("ничего не consumed — манифестов и не создавалось", store.manifests.size === 0);
+  }
+
+  // (e) превышение cfg.sendBatchMax на automation-пути → тот же отказ, что и
+  // на обычном плановом пути.
+  {
+    const store = makeStore();
+    const okCheck = async () => ({ ok: true, channel: "window:cap" });
+    const bigPlan = () => ({ payload: PAYLOAD, objectHash: OBJHASH, preview: "p", batchSize: 11 });
+    const dec = await requireConsent({
+      tool: "drive_share",
+      accountLabel: "personal",
+      plan: bigPlan,
+      rehash,
+      store,
+      cfg,
+      automationKey: "GOOD",
+      checkAutomationKey: okCheck,
+    });
+    check("батч > капа на automation-пути → refused", dec.kind === "refused");
+    check(
+      "то же сообщение про разбивку, что и на обычном пути",
+      dec.result.includes("Разбей") || dec.result.includes("больше предела"),
+      dec.result?.slice(0, 80),
+    );
+    check("манифест не создан", store.manifests.size === 0);
+  }
+
+  // (f) пустой automationKey ("") с подключённым checkAutomationKey — ветка
+  // не входит вовсе (как будто ключа не было), обычная фаза плана.
+  {
+    const store = makeStore();
+    const okCheck = async () => ({ ok: true, channel: "window:should-not-be-called" });
+    const dec = await requireConsent({
+      tool: "drive_share",
+      accountLabel: "personal",
+      plan,
+      rehash,
+      store,
+      cfg,
+      automationKey: "",
+      checkAutomationKey: okCheck,
+    });
+    check("пустой ключ → kind=planned, обычная фаза плана", dec.kind === "planned");
+  }
+}
+
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);
 process.exit(failures === 0 ? 0 : 1);

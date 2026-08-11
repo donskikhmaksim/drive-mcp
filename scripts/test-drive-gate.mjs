@@ -95,7 +95,7 @@ function buildClients(world) {
   };
 }
 
-async function harness(world) {
+async function harness(world, opts = {}) {
   const clients = buildClients(world);
   const manifests = new Map();
   const audits = [];
@@ -130,7 +130,12 @@ async function harness(world) {
       if (a) Object.assign(a, outcome);
     },
   };
-  const consentCtx = { consentStore, consentCfg: { server: "drive", consentTtlMs: 3_600_000, minConsentGapMs: 0, sendBatchMax: 10 }, auditStore: null };
+  const consentCtx = {
+    consentStore,
+    consentCfg: { server: "drive", consentTtlMs: 3_600_000, minConsentGapMs: 0, sendBatchMax: 10 },
+    auditStore: null,
+    checkAutomationKey: opts.checkAutomationKey,
+  };
   const server = new McpServer({ name: "drive-gate-e2e", version: "0" });
   registerAccountTools(server, clients);
   registerDriveTools(server, clients, consentCtx);
@@ -262,6 +267,35 @@ console.log("\n[6] drive_unshare: plan→confirm→revoke, post-verify confirms 
   check("execute succeeds", execBody.includes('"summary": "🔒 Отозван доступ 1/1"'), execBody.slice(0, 60));
   check("permission gone from world", world.permissions.get("F1").length === 0);
   check("post-verify confirms removal against live permissions", execBody.includes("✅") && execBody.includes("Независимая проверка отзыва доступа"));
+}
+
+// ── [7] automation_key: живой инструмент (drive_trash) принимает и
+// прокидывает automation_key в requireConsent — не только ядро гейта в
+// изоляции (ТЗ TZ_automation_key_consent_gate.md, тестовый план п.7) ────────
+console.log("\n[7] drive_trash: automation_key валиден → мутация с ПЕРВОГО вызова, без manifest_id/user_reply");
+{
+  const world = makeDriveWorld();
+  const checkAutomationKey = async (key) => (key === "GOOD-TOKEN" ? { ok: true, channel: "window:test" } : { ok: false });
+  const { cli } = await harness(world, { checkAutomationKey });
+
+  const resp = await cli.callTool({ name: "drive_trash", arguments: { fileIds: ["F1"], automation_key: "GOOD-TOKEN" } });
+  const body = text(resp);
+  check("исполнено с первого вызова (не 'план', а результат мутации)", body.includes('"summary"'), body.slice(0, 200));
+  check("файл реально в корзине", world.files.get("F1").trashed === true);
+  check("ответ НЕ несёт признаков плана (не просит подтвердить)", !body.includes("дождись его ответа"));
+}
+
+console.log("\n[7b] drive_trash: НЕВАЛИДНЫЙ automation_key → тихий fallthrough, обычный план, файл цел");
+{
+  const world = makeDriveWorld();
+  const checkAutomationKey = async () => ({ ok: false });
+  const { cli } = await harness(world, { checkAutomationKey });
+
+  const resp = await cli.callTool({ name: "drive_trash", arguments: { fileIds: ["F1"], automation_key: "WRONG-TOKEN" } });
+  const body = text(resp);
+  check("невалидный ключ → обычный план (просит подтверждения)", body.includes("дождись его ответа"), body.slice(0, 200));
+  check("файл НЕ тронут", world.files.get("F1").trashed === false);
+  check("отказ/план не проговаривает automation_key явно", !body.toLowerCase().includes("automation_key"));
 }
 
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);
