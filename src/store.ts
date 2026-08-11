@@ -1112,4 +1112,44 @@ export async function listApprovedUnexecuted(server: string, nowMs: number, limi
   }));
 }
 
+// ---- Automation-key windows (read-only) ----
+//
+// `tg_automation_windows` — общая таблица на всю экосистему (ТЗ
+// `TZ_automation_key_hub.md`). Владелец записи (генерация/отзыв) —
+// ИСКЛЮЧИТЕЛЬНО gmail-mcp (`src/automation_key.ts` там); drive-mcp это
+// подключение ТОЛЬКО читает, тем же Postgres (тот же `pool`, что и
+// consent_manifests/consent_audit/tg_approvals выше — `initStore` вызывается
+// один раз на процесс, второе подключение здесь не создаётся). Никакого
+// CREATE TABLE здесь — если строки/таблицы ещё нет (например gmail-mcp ни
+// разу не стартовал на свежей БД), запрос ниже бросит ошибку, и вызывающий
+// (`../automationKey.ts` в этом репозитории) ловит её и трактует как "ключ
+// не подтверждён" — тихий fallthrough на обычный путь, не падение сервиса.
+
+export interface AutomationWindowLookup {
+  windowId: string;
+  scope: string;
+}
+
+/**
+ * Ищет активное (не отозванное, не истёкшее) окно automation_key по
+ * SHA-256-хешу присланного сырого токена. Читает `tg_automation_windows`
+ * тем же подключением, что и остальной consent-слой выше — DSN берётся из
+ * того же `initStore(databaseUrl, ...)` (drive-mcp's `config.onboarding.
+ * databaseUrl` / env `DATABASE_URL`), второе подключение НЕ создаётся.
+ */
+export async function findActiveAutomationWindow(
+  tokenHash: string,
+  nowMs: number,
+): Promise<AutomationWindowLookup | null> {
+  const p = getPool();
+  const res = await p.query(
+    `SELECT window_id, scope FROM tg_automation_windows
+     WHERE token_hash = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > $2)
+     LIMIT 1`,
+    [tokenHash, nowMs],
+  );
+  if (!res.rows.length) return null;
+  return { windowId: res.rows[0].window_id as string, scope: (res.rows[0].scope as string | null) ?? "" };
+}
+
 export { randomUUID };

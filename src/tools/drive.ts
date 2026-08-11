@@ -24,6 +24,7 @@ import {
   sha256,
   formatLaTime,
   USER_REPLY_DOC,
+  AUTOMATION_KEY_DOC,
   type ConsentStore,
   type ConsentConfig,
   type ConsentAddressing,
@@ -107,6 +108,15 @@ export interface DriveConsentContext {
    * TG_APPROVAL_ENABLED=true does have runtime effect here.
    */
   tg?: TgApprovalGate;
+  /**
+   * Optional DI for the automation_key fast path (`../consent.js`'s
+   * `RequireConsentParams.checkAutomationKey`, ТЗ
+   * `TZ_automation_key_consent_gate.md`). undefined behaves exactly as if
+   * this field didn't exist — the branch inside `requireConsent()` is never
+   * entered, byte-identical to pre-automation_key behaviour. Real value comes
+   * from `../automationKey.js`'s `checkAutomationKey`, wired in server.ts.
+   */
+  checkAutomationKey?: (key: string) => Promise<{ ok: boolean; channel?: string }>;
 }
 
 /** Fallback gate config for callers that don't wire a real one (offline unit
@@ -1761,11 +1771,12 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, folders, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ account, folders, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Создание папок недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -1783,6 +1794,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!folders || !folders.length) {
             throw new Error("Нужен непустой `folders`, чтобы построить план создания.");
@@ -1835,11 +1848,12 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: false, idempotentHint: true },
     },
-    guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ account, items, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Переименование недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -1857,6 +1871,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план переименования.");
@@ -1920,11 +1936,12 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ account, items, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Перемещение недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -1942,6 +1959,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план перемещения.");
@@ -1998,11 +2017,12 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: true },
     },
-    guard(async ({ account, fileIds, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ account, fileIds, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Удаление в Корзину недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -2020,6 +2040,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!fileIds || !fileIds.length) {
             throw new Error("Нужен непустой `fileIds`, чтобы построить план удаления в Корзину.");
@@ -2092,11 +2114,12 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, files, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ account, files, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Загрузка недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -2114,6 +2137,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!files || !files.length) {
             throw new Error("Нужен непустой `files`, чтобы построить план загрузки.");
@@ -2223,11 +2248,12 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, files, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ account, files, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Создание сессии загрузки недоступно: не настроено хранилище согласия (DATABASE_URL). Без него " +
@@ -2245,6 +2271,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!files || !files.length) {
             throw new Error("Нужен непустой `files`, чтобы построить план создания сессии загрузки.");
@@ -2498,11 +2526,12 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: true },
     },
-    guard(async ({ account, files, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ account, files, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Перезапись недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -2520,6 +2549,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!files || !files.length) {
             throw new Error("Нужен непустой `files`, чтобы построить план перезаписи.");
@@ -2691,10 +2722,11 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, files, ttlMinutes, manifest_id, user_reply }) => {
+    guard(async ({ account, files, ttlMinutes, manifest_id, user_reply, automation_key }) => {
       if (!downloadsAvailable()) {
         return fail(
           "Download links are unavailable: this server does not know its own public URL. " +
@@ -2702,7 +2734,7 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
             "drive_download_file still works for small files.",
         );
       }
-      const { consentStore, consentCfg, tg } = ctx;
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Выдача ссылок недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -2721,6 +2753,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!files || !files.length) {
             throw new Error("Нужен непустой `files`, чтобы построить план выдачи ссылок.");
@@ -2939,11 +2973,12 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: true },
     },
-    guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ account, items, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Открытие доступа недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -2961,6 +2996,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план открытия доступа.");
@@ -3032,11 +3069,12 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: true },
     },
-    guard(async ({ account, items, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ account, items, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Отзыв доступа недоступен: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -3054,6 +3092,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!items || !items.length) {
             throw new Error("Нужен непустой `items`, чтобы построить план отзыва доступа.");

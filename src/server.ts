@@ -8,6 +8,7 @@ import { registerSkillVersionTools } from "./tools/skill_version.js";
 import type { ConsentStore, ConsentConfig } from "./consent.js";
 import type { TgApprovalGate, TgApprovalStore } from "./tg_approval.js";
 import { createTgApprovalGate } from "./tg_approval.js";
+import { checkAutomationKey } from "./automationKey.js";
 import {
   storeReady,
   createManifest,
@@ -95,6 +96,18 @@ export const tgApprovalStoreAdapter: TgApprovalStore = {
  */
 export const tgApprovalGate: TgApprovalGate = createTgApprovalGate(tgApprovalConfig, tgApprovalStoreAdapter);
 
+/**
+ * DI wired into every gated tool's `requireConsent({ checkAutomationKey })`
+ * (ТЗ `TZ_automation_key_consent_gate.md`). Unconditionally the real
+ * implementation — `automationKey.ts`'s `checkAutomationKey` already
+ * collapses every failure mode (DB down, table missing, key not found, scope
+ * doesn't cover "drive") into `{ ok: false }`, so there's no "feature off"
+ * state to model here the way `tgApprovalGate` needs one; a tool call
+ * without `automation_key` never even calls this (consent.ts's `if
+ * (p.automationKey && p.checkAutomationKey)` guard).
+ */
+export { checkAutomationKey };
+
 export function buildMcpServer(user: User): McpServer {
   const clients = buildUserClients(user);
   const accountsHint = clients.multi
@@ -114,6 +127,7 @@ export function buildMcpServer(user: User): McpServer {
     consentCfg: consentServerConfig,
     auditStore: storeReady() ? auditStoreAdapter : null,
     tg: tgApprovalGate,
+    checkAutomationKey,
   };
   registerAccountTools(server, clients);
   registerDriveTools(server, clients, consentCtx);

@@ -38,6 +38,7 @@ import {
   requireConsent,
   sha256,
   USER_REPLY_DOC,
+  AUTOMATION_KEY_DOC,
   type ConsentStore,
 } from "../consent.js";
 import {
@@ -405,11 +406,12 @@ export function registerSkillVersionTools(server: McpServer, userClients: UserCl
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ skill_name, new_version, new_content, date, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ skill_name, new_version, new_content, date, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Обновление версии навыка недоступно: не настроено хранилище согласия (DATABASE_URL). Без него " +
@@ -427,6 +429,8 @@ export function registerSkillVersionTools(server: McpServer, userClients: UserCl
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!skill_name || !new_version || new_content === undefined) {
             throw new Error("Нужны `skill_name`, `new_version` и `new_content`, чтобы построить план.");

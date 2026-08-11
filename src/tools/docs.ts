@@ -12,6 +12,7 @@ import {
   requireConsent,
   sha256,
   USER_REPLY_DOC,
+  AUTOMATION_KEY_DOC,
   type ConsentStore,
   type ConsentAddressing,
 } from "../consent.js";
@@ -622,11 +623,12 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: false },
     },
-    guard(async ({ account, title, text, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ account, title, text, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Создание документа недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -644,6 +646,8 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!title) {
             throw new Error("Нужен `title`, чтобы построить план создания документа.");
@@ -690,10 +694,11 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
     },
-    guard(async ({ account, documentId, text, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ account, documentId, text, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Добавление текста недоступно: не настроено хранилище согласия (DATABASE_URL). Без него сервер не " +
@@ -711,6 +716,8 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!documentId || text === undefined) {
             throw new Error("Нужны `documentId` и `text`, чтобы построить план добавления текста.");
@@ -760,10 +767,11 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
     },
-    guard(async ({ account, documentId, index, text, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ account, documentId, index, text, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Вставка текста недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -781,6 +789,8 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!documentId || index === undefined || text === undefined) {
             throw new Error("Нужны `documentId`, `index` и `text`, чтобы построить план вставки.");
@@ -832,11 +842,12 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: true },
     },
-    guard(async ({ account, documentId, find, replace, matchCase, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ account, documentId, find, replace, matchCase, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Замена текста недоступна: не настроено хранилище согласия (DATABASE_URL). Без него сервер не может " +
@@ -855,6 +866,8 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!documentId || find === undefined || replace === undefined) {
             throw new Error("Нужны `documentId`, `find` и `replace`, чтобы построить план замены.");
@@ -909,11 +922,12 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
           .optional()
           .describe("Id of a plan built by a previous no-argument call. Pass together with `user_reply` to execute it."),
         user_reply: z.string().optional().describe(USER_REPLY_DOC),
+        automation_key: z.string().optional().describe(AUTOMATION_KEY_DOC),
       },
       annotations: { destructiveHint: true },
     },
-    guard(async ({ account, documentId, requests, manifest_id, user_reply }) => {
-      const { consentStore, consentCfg, tg } = ctx;
+    guard(async ({ account, documentId, requests, manifest_id, user_reply, automation_key }) => {
+      const { consentStore, consentCfg, tg, checkAutomationKey } = ctx;
       if (!consentStore) {
         return fail(
           "Применение raw batchUpdate недоступно: не настроено хранилище согласия (DATABASE_URL). Без него " +
@@ -931,6 +945,8 @@ export function registerDocsTools(server: McpServer, clients: UserClients, ctx: 
         store: consentStore,
         cfg: consentCfg,
         tg,
+        automationKey: automation_key,
+        checkAutomationKey,
         plan: async () => {
           if (!documentId || !requests || !requests.length) {
             throw new Error("Нужны `documentId` и непустой `requests`, чтобы построить план.");
