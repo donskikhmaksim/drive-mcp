@@ -260,6 +260,15 @@ export async function startHttpServer(config: Config): Promise<void> {
       res.status(gres.status === 206 ? 206 : 200);
       res.setHeader("Content-Type", target.mimeType);
       res.setHeader("Content-Disposition", contentDisposition(target.name));
+      // `Content-Disposition: attachment` (above) already stops the browser
+      // from rendering this response as a page on direct navigation. It does
+      // NOT stop the same URL from being loaded as a SUBRESOURCE of someone
+      // else's page (<script src=…>, <object>, <embed>) — there, without
+      // nosniff, the browser is free to sniff the content and execute it as
+      // HTML/JS. `nosniff` closes that: the type is taken from Content-Type
+      // only. Second line of defence: exploitation still requires knowing
+      // the secret link.
+      res.setHeader("X-Content-Type-Options", "nosniff");
       res.setHeader("Accept-Ranges", "bytes");
       // The link is a secret; keep proxies and shared caches out of it.
       res.setHeader("Cache-Control", "private, no-store");
