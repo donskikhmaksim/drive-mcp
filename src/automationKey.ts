@@ -23,32 +23,45 @@ import { findActiveAutomationWindow } from "./store.js";
  * (`docs/TZ_automation_key_hub.md`: gmail/calendar/drive/sheets/docs/ticktick). */
 export const AUTOMATION_SERVICE = "drive";
 
-/** true, если `scope` (csv или буквально "all") покрывает `service`. */
-function scopeCovers(scope: string, service: string): boolean {
+/**
+ * true, если `scope` (csv токенов, или буквально "all") покрывает вызов
+ * `tool` внутри `service`. Токены CSV бывают трёх видов:
+ *  - `all` — покрывает всё (обрабатывается отдельной веткой ниже);
+ *  - `<service>` — весь сервис целиком, ЛЮБОЙ его метод (обратная
+ *    совместимость со старыми окнами, выпущенными до этого ТЗ);
+ *  - `<service>:<tool>` — ровно один метод.
+ * Сравнение токенов — ТОЧНОЕ (`===`), не подстрока/`startsWith`: тот же
+ * принцип, что уже защищает от "google-sheets матчит sheets", теперь ещё и
+ * от "gmail:gmail_send матчит gmail:gmail_send_extra".
+ */
+export function scopeCovers(scope: string, service: string, tool: string): boolean {
   if (scope === "all") return true;
-  return scope
+  const tokens = scope
     .split(",")
     .map((s) => s.trim())
-    .filter(Boolean)
-    .includes(service);
+    .filter(Boolean);
+  return tokens.some((t) => t === service || t === `${service}:${tool}`);
 }
 
 /**
  * DI-форма, которую ожидает `consent.ts`'s `RequireConsentParams.
  * checkAutomationKey`. Любой отказ (пустой вход, ошибка БД, таблица не
- * существует, ключ не найден, scope не покрывает "drive") схлопывается в
- * `{ ok: false }` — `consent.ts` трактует это как тихий fallthrough на
- * обычный человеческий путь, а не как ошибку, показанную модели (gate.md:
- * не подсказывать, что параметр вообще проверялся).
+ * существует, ключ не найден, scope не покрывает "drive"/этот метод)
+ * схлопывается в `{ ok: false }` — `consent.ts` трактует это как тихий
+ * fallthrough на обычный человеческий путь, а не как ошибку, показанную
+ * модели (gate.md: не подсказывать, что параметр вообще проверялся).
  */
-export async function checkAutomationKey(rawKey: string): Promise<{ ok: boolean; channel?: string }> {
+export async function checkAutomationKey(
+  rawKey: string,
+  tool: string,
+): Promise<{ ok: boolean; channel?: string }> {
   const key = rawKey.trim();
   if (!key) return { ok: false };
   try {
     const tokenHash = createHash("sha256").update(key).digest("hex");
     const window = await findActiveAutomationWindow(tokenHash, Date.now());
     if (!window) return { ok: false };
-    if (!scopeCovers(window.scope, AUTOMATION_SERVICE)) return { ok: false };
+    if (!scopeCovers(window.scope, AUTOMATION_SERVICE, tool)) return { ok: false };
     return { ok: true, channel: `window:${window.windowId}` };
   } catch (err) {
     // Таблица могла ещё не существовать (свежая БД, gmail-mcp ни разу не

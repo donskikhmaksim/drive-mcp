@@ -4,7 +4,9 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import type { Account, Config, User } from "./config.js";
-import { buildMcpServer, tgApprovalConfig, tgApprovalStoreAdapter, consentStoreAdapter, consentServerConfig } from "./server.js";
+import { buildMcpServer, buildCatalogServer, tgApprovalConfig, tgApprovalStoreAdapter, consentStoreAdapter, consentServerConfig } from "./server.js";
+import { listGatedTools } from "./gated_tools_catalog.js";
+import { AUTOMATION_SERVICE } from "./automationKey.js";
 import { handleWebhook, registerWebhook, secretTokenMatches, reportAutoExecutionResult } from "./tg_approval.js";
 import { tryAutoExecute } from "./consent.js";
 import { getAutoExecutor } from "./autoExecute.js";
@@ -168,6 +170,24 @@ export async function startHttpServer(config: Config): Promise<void> {
     res.json({ status: "ok", endpoint: "/mcp" });
   });
   app.get("/health", (_req, res) => res.json({ status: "ok" }));
+
+  // ---- automation_key method catalog (TZ_automation_key_method_catalog.md) ----
+  // Список ИМЁН гейтированных методов этого сервиса (drive_*/docs_*/
+  // skill_version_update — все живут в одном процессе под каноническим
+  // AUTOMATION_SERVICE="drive") для выбора scope "<service>:<tool>" в
+  // окне automation_key. Без авторизации намеренно: список имён методов не
+  // чувствительные данные (тот же принцип, что и tools/list по факту
+  // доступен любому, кто прошёл MCP-авторизацию — здесь даже без неё).
+  app.get("/automation-key-catalog", async (_req: Request, res: Response) => {
+    try {
+      const server = buildCatalogServer();
+      const tools = await listGatedTools(server);
+      res.json({ service: AUTOMATION_SERVICE, tools });
+    } catch (err) {
+      console.error("GET /automation-key-catalog failed:", err);
+      res.status(500).json({ error: "catalog_unavailable" });
+    }
+  });
 
   // ---- Optional Telegram-approval webhook (plan-tg-approval.md) ----
   // Deliberately OUTSIDE the normal /mcp auth -- Telegram itself calls this,

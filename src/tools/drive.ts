@@ -116,7 +116,7 @@ export interface DriveConsentContext {
    * entered, byte-identical to pre-automation_key behaviour. Real value comes
    * from `../automationKey.js`'s `checkAutomationKey`, wired in server.ts.
    */
-  checkAutomationKey?: (key: string) => Promise<{ ok: boolean; channel?: string }>;
+  checkAutomationKey?: (key: string, tool: string) => Promise<{ ok: boolean; channel?: string }>;
 }
 
 /** Fallback gate config for callers that don't wire a real one (offline unit

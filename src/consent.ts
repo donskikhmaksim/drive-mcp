@@ -269,7 +269,7 @@ export interface RequireConsentParams<T = unknown> {
    * каждого сервера — этот модуль её не импортирует напрямую (DI, тот же
    * приём, что и `ConsentStore`/`TgApprovalGate` выше).
    */
-  checkAutomationKey?: (key: string) => Promise<{ ok: boolean; channel?: string }>;
+  checkAutomationKey?: (key: string, tool: string) => Promise<{ ok: boolean; channel?: string }>;
 }
 
 /** Размеченный union исхода. Отказы — здесь, НЕ через throw. */
@@ -554,7 +554,7 @@ export async function requireConsent<T = unknown>(
   // (gate.md: не подсказывать модели, что параметр вообще существует/
   // проверялся — иначе она получает сигнал, что стоит его перебирать).
   if (p.automationKey && p.checkAutomationKey) {
-    const akCheck = await p.checkAutomationKey(p.automationKey);
+    const akCheck = await p.checkAutomationKey(p.automationKey, tool);
     if (akCheck.ok) {
       const built = await plan();
       if (built.batchSize != null && built.batchSize > cfg.sendBatchMax) {

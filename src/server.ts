@@ -108,6 +108,36 @@ export const tgApprovalGate: TgApprovalGate = createTgApprovalGate(tgApprovalCon
  */
 export { checkAutomationKey };
 
+/**
+ * Синтетический `User`, используемый ТОЛЬКО для собрать сервер под
+ * `listGatedTools` (`gated_tools_catalog.ts`) — `/automation-key-catalog`
+ * не завязан на конкретного вызывающего пользователя (список ИМЁН методов
+ * не секрет), а `buildMcpServer` требует `User` на входе просто чтобы
+ * построить `GoogleClients` (лениво, без сетевых вызовов при конструкции —
+ * см. `google.ts`'s `createGoogleClients`). Набор зарегистрированных тулов
+ * НЕ зависит от содержимого аккаунтов (`accounts.ts`'s `clients.multi`
+ * влияет только на текст description сервера, не на состав тулов), так что
+ * этот каталог — ТОЧНЫЙ список тулов для любого реального пользователя,
+ * а не приближение "типового" юзера.
+ */
+const CATALOG_SYNTHETIC_USER: User = {
+  name: "catalog-synthetic",
+  accounts: [
+    {
+      name: "catalog",
+      auth: { mode: "oauth", clientId: "catalog", clientSecret: "catalog", refreshToken: "catalog" },
+    },
+  ],
+  defaultAccount: "catalog",
+};
+
+/** Собирает одноразовый `McpServer` только для чтения его каталога тулов
+ * (`/automation-key-catalog`, `gated_tools_catalog.ts`'s `listGatedTools`).
+ * Не для обслуживания реального MCP-трафика. */
+export function buildCatalogServer(): McpServer {
+  return buildMcpServer(CATALOG_SYNTHETIC_USER);
+}
+
 export function buildMcpServer(user: User): McpServer {
   const clients = buildUserClients(user);
   const accountsHint = clients.multi
