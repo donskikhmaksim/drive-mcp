@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { User } from "./config.js";
-import { loadConsentGateConfig, loadTgApprovalConfig } from "./config.js";
+import { loadConsentGateConfig, loadTgApprovalConfig, loadConsentHubSecret } from "./config.js";
 import { buildUserClients, registerAccountTools } from "./accounts.js";
 import { registerDriveTools, type DriveConsentContext } from "./tools/drive.js";
 import { registerDocsTools } from "./tools/docs.js";
@@ -59,7 +59,13 @@ export const consentServerConfig: ConsentConfig = {
   consentTtlMs: consentGateEnv.consentTtlMs,
   minConsentGapMs: consentGateEnv.minConsentGapMs,
   sendBatchMax: consentGateEnv.sendBatchMax,
+  syncWaitMs: consentGateEnv.syncWaitMs,
+  syncPollMs: consentGateEnv.syncPollMs,
 };
+
+/** Часть 2 (`TZ_consent_web_hub.md`): общий секрет `/pending-consents`*
+ * роутов (http.ts). "" ⇒ фича выключена (fail-closed) — см. `loadConsentHubSecret`. */
+export const consentHubSecret = loadConsentHubSecret();
 
 /**
  * Optional Telegram-approval layer (plan-tg-approval.md). Loaded once at

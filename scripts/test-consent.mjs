@@ -482,5 +482,144 @@ console.log("\n[16] automation_key: валидный ключ исполняет
   }
 }
 
+// ── 17. Часть 1 (ТЗ_consent_web_hub.md): гибридное короткое ожидание ────────
+// Реальные (маленькие) таймеры — sleep() внутри requireConsent использует
+// настоящий setTimeout, часы cfg.now здесь НЕ подкручиваем вручную кроме
+// теста таймаута (17.4), где нужен реально текущий Date.now, иначе цикл
+// никогда не увидит now() >= deadline и тест повиснет.
+{
+  console.log("\n[17] Часть 1: гибридное короткое ожидание (sync-wait)");
+
+  // 17.1 syncWaitMs=0 (дефолт cfg выше не задаёт это поле) — побайтово как
+  // раньше: обычный planned, без единой доп. итерации опроса.
+  {
+    const store = makeStore();
+    let getManifestCalls = 0;
+    const wrapped = { ...store, getManifest: (...a) => { getManifestCalls++; return store.getManifest(...a); } };
+    const dec = await requireConsent({ tool: "drive_share", accountLabel: "personal", plan, rehash, store: wrapped, cfg });
+    check("syncWaitMs не задан → kind=planned как раньше", dec.kind === "planned");
+    check("ни одного опроса стора сверх обычного плана", getManifestCalls === 0);
+  }
+
+  // 17.2 Подтверждено «человеком» в середине окна (мок меняет статус на 2-й
+  // опрос) — requireConsent возвращает готовый положительный результат
+  // ОДНИМ вызовом, БЕЗ повторного исполнения (см. большой комментарий в
+  // consent.ts про двойное исполнение — намеренно НЕ kind:"confirmed",
+  // а kind:"refused" с положительным текстом: та же форма, что уже
+  // безусловно ретранслируют все ~25 вызывающих тулов, без риска повторно
+  // дёрнуть payload).
+  {
+    const store = makeStore();
+    let polls = 0;
+    const flippingStore = {
+      ...store,
+      getManifest: async (id, server) => {
+        polls++;
+        if (polls >= 2) {
+          const row = store.manifests.get(id);
+          if (row) { row.status = "DONE"; row.consumedAt = clock.t; row.userReply = "подтверждаю через веб"; }
+        }
+        return store.getManifest(id, server);
+      },
+    };
+    const syncCfg = { ...cfg, syncWaitMs: 200, syncPollMs: 5 };
+    const dec = await requireConsent({ tool: "drive_share", accountLabel: "personal", plan, rehash, store: flippingStore, cfg: syncCfg });
+    check("подтверждено в окне → kind=refused (положительная ретрансляция, НЕ повторное исполнение)", dec.kind === "refused", JSON.stringify(dec).slice(0, 120));
+    check("текст положительный (не 🛑)", dec.kind === "refused" && dec.result.includes("✅ Подтверждено и исполнено"));
+    check("опрос остановился рано (не проболтался все 200мс)", polls < 40);
+    check("манифест реально DONE в сторе (мутация «произошла» — консюм не наш)", [...store.manifests.values()][0].status === "DONE");
+  }
+
+  // 17.3 Отклонено в окне ожидания — refused с тем же текстом, что и обычный
+  // путь отказа («Отменено пользователем»), манифест НЕ трогаем повторно.
+  {
+    const store = makeStore();
+    let polls = 0;
+    const flippingStore = {
+      ...store,
+      getManifest: async (id, server) => {
+        polls++;
+        if (polls >= 2) {
+          const row = store.manifests.get(id);
+          if (row) { row.status = "INVALIDATED"; row.userReply = "нет, не надо"; }
+        }
+        return store.getManifest(id, server);
+      },
+    };
+    const syncCfg = { ...cfg, syncWaitMs: 200, syncPollMs: 5 };
+    const dec = await requireConsent({ tool: "drive_share", accountLabel: "personal", plan, rehash, store: flippingStore, cfg: syncCfg });
+    check("отклонено в окне → kind=refused", dec.kind === "refused");
+    check("тот же текст, что и обычный путь отказа", dec.kind === "refused" && dec.result.includes("Отменено пользователем"));
+    check("реплика попала в текст", dec.kind === "refused" && dec.result.includes("нет, не надо"));
+  }
+
+  // 17.4 Никто не решил за окно — таймаут → ОБЫЧНОЕ превью (planned), ровно
+  // то же, что и без фичи; после этого обычный execute manifest_id+user_reply
+  // по-прежнему работает (регресс). Настоящие часы (не фиксированные) —
+  // иначе цикл никогда не увидит now() >= deadline.
+  {
+    const store = makeStore();
+    const syncCfg = { ...cfg, syncWaitMs: 30, syncPollMs: 5, now: () => Date.now() };
+    const dec = await requireConsent({ tool: "drive_share", accountLabel: "personal", plan, rehash, store, cfg: syncCfg });
+    check("никто не решил → kind=planned (обычное превью)", dec.kind === "planned", JSON.stringify(dec).slice(0, 100));
+    check("манифест остался AWAITING_CONSENT", [...store.manifests.values()][0].status === "AWAITING_CONSENT");
+
+    // Регресс: обычный второй вызов с manifest_id+user_reply всё ещё работает.
+    // minConsentGapMs=0 здесь: реальные часы (Date.now) между двумя вызовами
+    // теста прошли миллисекунды, не 2с — это тест регресса execute-пути, а
+    // не анти-дуплета (тот уже покрыт отдельно в [3] с управляемыми часами).
+    const dec2 = await requireConsent({
+      tool: "drive_share", accountLabel: "personal", plan, rehash, store,
+      cfg: { ...syncCfg, minConsentGapMs: 0 },
+      manifestId: dec.manifestId, userReply: "да, отправляй",
+    });
+    check("после таймаута обычный execute-вызов подтверждает как раньше", dec2.kind === "confirmed", JSON.stringify(dec2).slice(0, 100));
+  }
+
+  // 17.5 Binding-чек срабатывает и на sync-пути: rehash разошёлся →
+  // положительный, но с явным предупреждением о рассинхроне, НЕ тихое
+  // подтверждение без оговорок.
+  {
+    const store = makeStore();
+    let polls = 0;
+    const flippingStore = {
+      ...store,
+      getManifest: async (id, server) => {
+        polls++;
+        if (polls >= 2) {
+          const row = store.manifests.get(id);
+          if (row) { row.status = "DONE"; row.consumedAt = clock.t; row.userReply = "ок"; }
+        }
+        return store.getManifest(id, server);
+      },
+    };
+    const mismatchRehash = () => sha256({ changed: true });
+    const syncCfg = { ...cfg, syncWaitMs: 200, syncPollMs: 5 };
+    const dec = await requireConsent({ tool: "drive_share", accountLabel: "personal", plan, rehash: mismatchRehash, store: flippingStore, cfg: syncCfg });
+    check("binding-рассинхрон на sync-пути → refused (не тихое исполнение)", dec.kind === "refused", JSON.stringify(dec).slice(0, 120));
+    check("предупреждение о рассинхроне присутствует", dec.kind === "refused" && dec.result.toLowerCase().includes("измен"));
+    check("НЕ положительный «Подтверждено и исполнено» заголовок без оговорок", dec.kind === "refused" && !dec.result.includes("✅ Подтверждено и исполнено"));
+  }
+
+  // 17.6 automation_key + sync одновременно: валидный ключ исполняет СРАЗУ,
+  // до опроса — ни одной итерации опроса не происходит (automation-ветка
+  // проверяется РАНЬШЕ hasId/hasReply-развилки, sync-wait живёт внутри
+  // ветки "нет ни id, ни reply", до которой в этом случае дело не доходит).
+  {
+    const store = makeStore();
+    let getManifestCalls = 0;
+    const wrapped = { ...store, getManifest: (...a) => { getManifestCalls++; return store.getManifest(...a); } };
+    const okCheck = async () => ({ ok: true, channel: "window:sync-ak" });
+    const syncCfg = { ...cfg, syncWaitMs: 5_000, syncPollMs: 5 };
+    const dec = await requireConsent({
+      tool: "drive_share", accountLabel: "personal", plan, rehash, store: wrapped, cfg: syncCfg,
+      automationKey: "GOOD", checkAutomationKey: okCheck,
+    });
+    check("automation_key + sync → confirmed немедленно", dec.kind === "confirmed");
+    check("ни одной итерации опроса (automation — раньше sync-wait)", getManifestCalls === 0);
+    check("манифест вообще не создавался (automation исполняет без хранения)", store.manifests.size === 0);
+  }
+}
+
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);
 process.exit(failures === 0 ? 0 : 1);

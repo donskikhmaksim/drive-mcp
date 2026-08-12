@@ -193,6 +193,17 @@ export interface ConsentConfig {
   minConsentGapMs: number;
   /** Кап размера батча одного манифеста (env SEND_BATCH_MAX, дефолт 10). */
   sendBatchMax: number;
+  /**
+   * Часть 1 (ТЗ_consent_web_hub.md): сколько мс СИНХРОННО ждать (коротким
+   * опросом) подтверждения СРАЗУ после построения плана, до возврата превью
+   * модели — гибридное ожидание. Env `CONSENT_SYNC_WAIT_MS`, дефолт 25000.
+   * `undefined`/`0` ⇒ ветка выключена целиком, побайтовая совместимость —
+   * ни одного лишнего запроса к стору, ни одной задержки.
+   */
+  syncWaitMs?: number;
+  /** Интервал опроса внутри `syncWaitMs`-окна, мс. Env `CONSENT_SYNC_POLL_MS`,
+   * дефолт 1000. Не используется, если `syncWaitMs` не задан/0. */
+  syncPollMs?: number;
   /** Инъекция часов (для тестов). Дефолт Date.now. */
   now?: () => number;
 }
@@ -327,6 +338,11 @@ function sortDeep(v: unknown): unknown {
 /** sha256(canonicalJson(value)) в hex — стабильный objectHash для binding. */
 export function sha256(value: unknown): string {
   return createHash("sha256").update(canonicalJson(value)).digest("hex");
+}
+
+/** Реальный wall-clock sleep (Часть 1: гибридное ожидание в requireConsent). */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Время в America/Los_Angeles как «5 авг, 07:15» (ТЗ A.4 — всегда LA, не UTC). */
@@ -653,6 +669,77 @@ export async function requireConsent<T = unknown>(
       previewBody =
         `${built.preview}\n\n_⏳ Запрос на подтверждение отправлен в Telegram — подтвердите кнопкой в ` +
         `боте, затем ответьте «да» здесь._`;
+    }
+
+    // ───── Часть 1 (ТЗ_consent_web_hub.md): гибридное короткое ожидание ─────
+    // ПОСЛЕ создания манифеста (и, если включён, TG-нотифай выше), ДО
+    // возврата превью — короткий опрос СОБСТВЕННОГО стора: не решил ли
+    // человек этот манифест ПРЯМО СЕЙЧАС через какой-то ДРУГОЙ канал (веб-хаб
+    // `/pending-consents/decide`, будущие каналы). `cfg.syncWaitMs`
+    // undefined/0 ⇒ ветка не существует целиком — ни одного лишнего запроса
+    // к стору, ни одной задержки — побайтовая совместимость.
+    //
+    // БЕЗОПАСНОСТЬ (двойное исполнение — прочитай перед тем, как трогать):
+    // эта ветка ТОЛЬКО ЧИТАЕТ манифест — она НИКОГДА не зовёт
+    // `store.consumeManifest` сама. Атомарное потребление манифеста делает
+    // РОВНО ОДИН внешний исполнитель — `/pending-consents/decide`
+    // (`confirm`) через `tryAutoExecute` (http.ts), тем же путём, что и
+    // кнопка в Telegram. Если эта ветка увидела `status === "DONE"`, значит
+    // мутация УЖЕ произошла ТАМ. Вернуть отсюда `{kind: "confirmed",
+    // payload}` означало бы, что вызывающий ИНСТРУМЕНТ (drive_share и т.п.)
+    // исполнит её ЕЩЁ РАЗ — второе письмо, второй файл. Поэтому положительный
+    // исход отдаётся через ФОРМУ `{kind: "refused", result: <готовый
+    // текст>}` — ту же форму возврата, что и обычный отказ: КАЖДЫЙ
+    // вызывающий тул в этом репозитории уже безусловно делает `if
+    // (decision.kind === "refused") return ok(decision.result);` — то есть
+    // просто ретранслирует текст модели БЕЗ повторного исполнения payload.
+    // Это осознанное отступление от буквального "kind: confirmed" из текста
+    // ТЗ ради безопасности (нулевой риск двойной мутации, нуль изменений в
+    // ~25 существующих call site'ах) — явно объяснено в отчёте по задаче.
+    const syncWaitMs = cfg.syncWaitMs ?? 0;
+    if (syncWaitMs > 0) {
+      const pollMs = cfg.syncPollMs ?? 1000;
+      const deadline = now() + syncWaitMs;
+      let lastRow: ConsentManifestRow | null = null;
+      while (now() < deadline) {
+        await sleep(pollMs);
+        lastRow = await store.getManifest(id, cfg.server);
+        if (!lastRow || lastRow.status !== "AWAITING_CONSENT") break;
+      }
+      if (lastRow?.status === "DONE") {
+        // Binding — ОБЯЗАТЕЛЕН и здесь (ТЗ, "Дисциплина"): план мог
+        // устареть даже за секунды ожидания. Мы НЕ повторяем исполнение —
+        // только честно предупреждаем, если живой мир на момент этого
+        // наблюдения разошёлся с тем, что было зафиксировано в манифесте.
+        const currentHash = await rehash(lastRow.payload);
+        const bindingOk = currentHash === lastRow.objectHash;
+        const header = bindingOk ? "✅ Подтверждено и исполнено" : "⚠️ Подтверждено, но состояние изменилось";
+        const body = bindingOk
+          ? `${previewBody}\n\nРешение по этому плану уже принято и исполнено через другой канал ` +
+            "(например, веб-подтверждение), пока шло ожидание ответа. Повторно вызывать этот инструмент " +
+            "с этим планом не нужно."
+          : `${previewBody}\n\nДействие было подтверждено и исполнено через другой канал, но состояние ` +
+            "окружения с момента построения плана уже успело измениться — фактический результат мог не " +
+            "совпасть с тем, что показано в плане выше. Проверьте результат отдельно.";
+        return { kind: "refused", result: renderConsentBlock(header, body) };
+      }
+      if (lastRow?.status === "INVALIDATED") {
+        // Отклонено в окне ожидания (ТЗ, исход 2) — ТОТ ЖЕ текст отказа, что
+        // и на обычном пути (execute-фаза, ветка negation). Манифест уже
+        // инвалидирован тем каналом, который принял решение — здесь не
+        // трогаем стор повторно, только ретранслируем.
+        return {
+          kind: "refused",
+          result: renderRefusal(
+            "Отменено пользователем",
+            `Пользователь ответил отказом («${inlineReply(lastRow.userReply ?? "")}»). План отменён, ` +
+              "ничего не отправлено. Чтобы повторить — построй план заново.",
+          ),
+        };
+      }
+      // lastRow === null (манифест исчез, маловероятно) ИЛИ дедлайн истёк, а
+      // статус всё ещё AWAITING_CONSENT — падаем в обычный planned-путь ниже
+      // (ТЗ, исход 3: ничего не потеряно, обычный асинхронный путь работает).
     }
 
     return { kind: "planned", manifestId: id, preview: renderPlanned(previewBody, id, expiresAt) };

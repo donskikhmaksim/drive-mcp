@@ -325,11 +325,40 @@ export interface ConsentGateConfig {
    * (plan §0.2/[R:полнота-7]); over the cap, the tool refuses with "split it
    * up" instead of creating a manifest. Env SEND_BATCH_MAX, default 10. */
   sendBatchMax: number;
+  /**
+   * Часть 1 (`TZ_consent_web_hub.md`): сколько мс `requireConsent` синхронно
+   * ждёт (короткий опрос собственного стора) сразу после построения плана,
+   * до возврата превью — гибридное ожидание. Env `CONSENT_SYNC_WAIT_MS`,
+   * дефолт 25000 (25с — с запасом под типовой ~60с таймаут MCP-клиента).
+   * `0` ⇒ ветка выключена целиком, побайтовая совместимость.
+   */
+  syncWaitMs: number;
+  /** Интервал опроса внутри `syncWaitMs`-окна, мс. Env `CONSENT_SYNC_POLL_MS`,
+   * дефолт 1000. */
+  syncPollMs: number;
 }
 
 function positiveIntEnv(name: string, fallback: number): number {
   const raw = Number(process.env[name]);
   return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+
+/** Same as `positiveIntEnv`, but 0 is a valid, meaningful value (feature-off
+ * switch) rather than "unset" — used by `CONSENT_SYNC_WAIT_MS`. */
+function nonNegativeIntEnv(name: string, fallback: number): number {
+  const raw = Number(process.env[name]);
+  return Number.isFinite(raw) && raw >= 0 ? raw : fallback;
+}
+
+/**
+ * Часть 2 (`TZ_consent_web_hub.md`): общий секрет на все 5 сервисов,
+ * авторизующий `GET /pending-consents` и `POST /pending-consents/decide`
+ * (заголовок `X-Consent-Hub-Secret`, константное сравнение в http.ts — тот
+ * же приём, что уже стоит на `/dashboard/:secret`). Не задан ⇒ "" ⇒ оба
+ * роута в http.ts отвечают 404 (fail-closed, фича выключена целиком).
+ */
+export function loadConsentHubSecret(): string {
+  return process.env.CONSENT_HUB_SECRET?.trim() || "";
 }
 
 export function loadConsentGateConfig(): ConsentGateConfig {
@@ -338,6 +367,8 @@ export function loadConsentGateConfig(): ConsentGateConfig {
     consentTtlMs: positiveIntEnv("CONSENT_TTL_MS", 3_600_000),
     minConsentGapMs: positiveIntEnv("MIN_CONSENT_GAP_MS", 2_000),
     sendBatchMax: positiveIntEnv("SEND_BATCH_MAX", 10),
+    syncWaitMs: nonNegativeIntEnv("CONSENT_SYNC_WAIT_MS", 25_000),
+    syncPollMs: positiveIntEnv("CONSENT_SYNC_POLL_MS", 1_000),
   };
 }
 
