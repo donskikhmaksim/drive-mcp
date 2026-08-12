@@ -727,6 +727,23 @@ export async function getManifest(id: string, server: string): Promise<ConsentMa
 }
 
 /**
+ * Часть 2 (`TZ_consent_web_hub.md`): всё, что сейчас ждёт человека для
+ * `GET /pending-consents` — свои (server-scoped), ещё не истёкшие,
+ * AWAITING_CONSENT манифесты, новейшие первыми (так удобнее для списка в
+ * веб-хабе — свежее сверху). Никакой отдельной таблицы/колонки под это не
+ * заводим — читаем ту же `consent_manifests`, что и `getManifest`.
+ */
+export async function listAwaitingConsentManifests(server: string, nowMs: number): Promise<ConsentManifestRow[]> {
+  const p = getPool();
+  const res = await p.query(
+    `SELECT * FROM consent_manifests WHERE server = $1 AND status = 'AWAITING_CONSENT' AND expires_at > $2
+      ORDER BY created_at DESC`,
+    [server, nowMs],
+  );
+  return res.rows.map(rowToManifest);
+}
+
+/**
  * Atomic one-shot consume — the eventual `[R:полнота]` proof against the double-
  * execute race, same shape as `consumeCode` above: a single `UPDATE … WHERE …
  * RETURNING` closes the race in the database, not in JS. Succeeds only if the

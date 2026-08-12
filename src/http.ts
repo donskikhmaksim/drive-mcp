@@ -4,11 +4,11 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import type { Account, Config, User } from "./config.js";
-import { buildMcpServer, buildCatalogServer, tgApprovalConfig, tgApprovalStoreAdapter, consentStoreAdapter, consentServerConfig } from "./server.js";
+import { buildMcpServer, buildCatalogServer, tgApprovalConfig, tgApprovalStoreAdapter, consentStoreAdapter, consentServerConfig, consentHubSecret } from "./server.js";
 import { listGatedTools } from "./gated_tools_catalog.js";
 import { AUTOMATION_SERVICE } from "./automationKey.js";
 import { handleWebhook, registerWebhook, secretTokenMatches, reportAutoExecutionResult } from "./tg_approval.js";
-import { tryAutoExecute } from "./consent.js";
+import { tryAutoExecute, type ConsentManifestRow } from "./consent.js";
 import { getAutoExecutor } from "./autoExecute.js";
 import { GoogleFederatedProvider } from "./oauthProvider.js";
 import {
@@ -18,6 +18,11 @@ import {
   setDefaultAccount,
   renameAccount,
   listApprovedUnexecuted,
+  listAwaitingConsentManifests,
+  getManifest,
+  invalidateManifest,
+  appendConsentAudit,
+  storeReady,
 } from "./store.js";
 import { renderDashboard } from "./dashboard.js";
 import { logDashboardLocation } from "./logRedaction.js";
@@ -186,6 +191,169 @@ export async function startHttpServer(config: Config): Promise<void> {
     } catch (err) {
       console.error("GET /automation-key-catalog failed:", err);
       res.status(500).json({ error: "catalog_unavailable" });
+    }
+  });
+
+  // ---- Часть 2 (TZ_consent_web_hub.md): backend-роуты веб-хаба подтверждений ----
+  // Общий секрет CONSENT_HUB_SECRET (X-Consent-Hub-Secret, константное
+  // сравнение — тот же приём, что и у /dashboard/:secret выше). Секрет не
+  // задан ⇒ ОБА роута отвечают 404 (fail-closed: не 401/403, чтобы не
+  // подтверждать существование роута кому-то без секрета вообще).
+  const hubAuthorized = (req: Request): boolean => {
+    if (!consentHubSecret) return false;
+    const provided = req.header("x-consent-hub-secret") ?? "";
+    return !!provided && secretMatches(provided, consentHubSecret);
+  };
+
+  /** Пункт списка `/pending-consents` (ТЗ Часть 2, п.1). В `consent_manifests`
+   * НЕТ отдельных колонок title/summary/preview (только `payload`/JSON) —
+   * миграцию таблицы ТЗ явно просит не делать без нужды, так что здесь ЧЕСТНО
+   * выводим короткие поля из уже существующего `payload`, а не из полного
+   * markdown-превью модели (оно нигде не сохраняется, строится заново на
+   * каждый `plan()` и уходит либо в ответ модели, либо в Telegram — see
+   * `consent.ts`'s `requireConsent`). Ограничение отмечено в отчёте по задаче.
+   */
+  const toPendingItem = (row: ConsentManifestRow) => {
+    let compact: string;
+    try {
+      compact = JSON.stringify(row.payload);
+    } catch {
+      compact = String(row.payload);
+    }
+    const summary = compact.length > 160 ? `${compact.slice(0, 159)}…` : compact;
+    return {
+      manifestId: row.id,
+      tool: row.tool,
+      title: row.tool,
+      summary,
+      preview: compact,
+      createdAt: row.createdAt,
+      expiresAt: row.expiresAt,
+      accountLabel: row.accountLabel,
+    };
+  };
+
+  app.get("/pending-consents", async (req: Request, res: Response) => {
+    if (!hubAuthorized(req)) {
+      res.status(404).end();
+      return;
+    }
+    if (!storeReady()) {
+      res.json({ service: consentServerConfig.server, items: [] });
+      return;
+    }
+    try {
+      const rows = await listAwaitingConsentManifests(consentServerConfig.server, Date.now());
+      res.json({ service: consentServerConfig.server, items: rows.map(toPendingItem) });
+    } catch (err) {
+      console.error("GET /pending-consents failed:", err);
+      res.status(500).json({ error: "unavailable" });
+    }
+  });
+
+  app.post("/pending-consents/decide", async (req: Request, res: Response) => {
+    if (!hubAuthorized(req)) {
+      res.status(404).end();
+      return;
+    }
+    const manifestId = typeof req.body?.manifestId === "string" ? req.body.manifestId : "";
+    const decision = req.body?.decision;
+    const comment = typeof req.body?.comment === "string" ? req.body.comment : "";
+    if (!manifestId || (decision !== "confirm" && decision !== "reject")) {
+      res.status(400).json({ ok: false, error: "bad_request" });
+      return;
+    }
+    if (!storeReady()) {
+      res.status(404).json({ ok: false, error: "not_found" });
+      return;
+    }
+    try {
+      const row = await getManifest(manifestId, consentServerConfig.server);
+      if (!row) {
+        res.status(404).json({ ok: false, error: "not_found" });
+        return;
+      }
+      if (row.status !== "AWAITING_CONSENT") {
+        res.status(409).json({ ok: false, error: "already_decided" });
+        return;
+      }
+      if (row.expiresAt <= Date.now()) {
+        res.status(410).json({ ok: false, error: "expired" });
+        return;
+      }
+
+      if (decision === "reject") {
+        // Тот же путь отказа, что и обычная негация в requireConsent
+        // (consent.ts, ветка "negation") — invalidate + audit-запись,
+        // `comment` (если есть) идёт как `userReply` (та же роль, что и
+        // человеческая реплика из Telegram/чата — ТЗ Часть 2, п.2).
+        const userReply = comment || "[веб-хаб: отклонено без комментария]";
+        await invalidateManifest(manifestId, consentServerConfig.server, userReply);
+        await appendConsentAudit({
+          id: randomUUID(),
+          ts: Date.now(),
+          server: consentServerConfig.server,
+          tool: row.tool,
+          accountLabel: row.accountLabel,
+          manifestId,
+          objectHash: row.objectHash,
+          userReply,
+          checks: { source: "consent_hub" },
+          outcome: "invalidated",
+          refusalReason: "web_hub_reject",
+          actor: "human",
+        });
+        res.json({ ok: true, outcome: "refused" });
+        return;
+      }
+
+      // decision === "confirm" — РОВНО тот же путь, что нажатие кнопки в
+      // Telegram (см. `runAutoExecutePoller` выше): переиспользуем
+      // `tryAutoExecute` (rehash-биндинг + атомарный consumeManifest + аудит)
+      // и зарегистрированный `AutoExecutorEntry.execute` (`autoExecute.ts`) —
+      // НЕ дублируем логику исполнения тула здесь.
+      const executor = getAutoExecutor(row.tool);
+      if (!executor) {
+        // Тул ещё не переведён на паттерн autoExecute.ts — гейт всё ещё
+        // рабочий (обычный чат-путь), но веб-хаб для НЕГО пока не может
+        // исполнить решение синхронно. Честно, не 500.
+        res.status(409).json({ ok: false, error: "no_executor" });
+        return;
+      }
+      const user = (await userFromGoogleAccounts(config)) ?? config.users[0] ?? null;
+      if (!user) {
+        res.status(503).json({ ok: false, error: "no_account" });
+        return;
+      }
+      const clients = buildUserClients(user);
+      const execCtx = { clients, consentStore: consentStoreAdapter };
+
+      // Ранний binding-чек (read-only, идемпотентный) — только чтобы отдать
+      // машиночитаемый `binding_mismatch` вместо общего `already_decided`,
+      // когда причина именно в рассинхроне состояния (ТЗ Часть 2, п.2).
+      const currentHash = await executor.rehash(row.payload, execCtx);
+      if (currentHash !== row.objectHash) {
+        res.status(409).json({ ok: false, error: "binding_mismatch" });
+        return;
+      }
+
+      const result = await tryAutoExecute(
+        { manifestId, tool: row.tool, accountLabel: row.accountLabel },
+        (addressing) => executor.rehash(addressing, execCtx),
+        consentStoreAdapter,
+        consentServerConfig,
+      );
+      if (!result) {
+        // Гонка — кто-то другой (обычный чат-путь / TG-кнопка) уже забрал
+        // этот манифест между чтением выше и этой атомарной попыткой.
+        res.status(409).json({ ok: false, error: "already_decided" });
+        return;
+      }
+      const reportText = await executor.execute(result.payload, result.auditId, execCtx);
+      res.json({ ok: true, outcome: "confirmed", result: reportText });
+    } catch (err) {
+      console.error(`POST /pending-consents/decide failed for manifest ${manifestId}:`, err);
+      res.status(500).json({ ok: false, error: "internal_error" });
     }
   });
 
