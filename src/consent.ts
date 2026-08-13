@@ -528,6 +528,26 @@ export function classifyReply(
   return "unknown";
 }
 
+// ───────────────────────── Аварийный общий выключатель гейта ───────────────
+
+const _GATE_DISABLED_ENV = "DRIVE_MCP_GATE_DISABLED";
+
+/** Аварийный общий выключатель гейта подтверждения — 2026-08-12, по прямой
+ * просьбе Максима, побайтовый перенос того же механизма из ticktick-mcp
+ * (`ticktick_mcp/src/consent.py`, `_gate_disabled()`). Точка отката ОДНА:
+ * переменная окружения, не правка кода — вернуть гейт можно, просто убрав
+ * переменную в Railway, без нового деплоя.
+ *
+ * Дефолт — гейт ВКЛЮЧЁН (переменная не задана = поведение не меняется).
+ * Когда выключен — КАЖДАЯ мутация проходит без user_reply/кнопки в
+ * Telegram; это буквально то, от чего весь `requireConsent` защищает (см.
+ * докстринг файла выше). Максим предупреждён и подтвердил явно. */
+function _gateDisabled(): boolean {
+  return ["1", "true", "yes", "on"].includes(
+    (process.env[_GATE_DISABLED_ENV] ?? "").trim().toLowerCase(),
+  );
+}
+
 // ───────────────────────── Ядро: requireConsent ────────────────────────────
 
 export async function requireConsent<T = unknown>(
@@ -539,6 +559,29 @@ export async function requireConsent<T = unknown>(
   const userReply = p.userReply ?? "";
   const hasId = manifestId !== "";
   const hasReply = userReply !== "";
+
+  if (_gateDisabled()) {
+    console.warn(
+      `🔓 ГЕЙТ ВЫКЛЮЧЕН переключателем ${_GATE_DISABLED_ENV}: действие ` +
+        `'${tool}' (account=${accountLabel}) выполнено БЕЗ подтверждения пользователя.`,
+    );
+    const built = await plan();
+    const auditId = randomUUID();
+    await store.appendConsentAudit({
+      id: auditId,
+      ts: now(),
+      server: cfg.server,
+      tool,
+      accountLabel,
+      manifestId: null,
+      objectHash: built.objectHash,
+      userReply: "[авто: gate_disabled_switch]",
+      checks: { gate: "disabled_switch" },
+      outcome: "confirmed",
+      actor: "gate_disabled_switch",
+    });
+    return { kind: "confirmed", manifestId: "", payload: built.payload as T, auditId };
+  }
 
   // Общий журнал отказа + возврат refused.
   const refuse = async (
