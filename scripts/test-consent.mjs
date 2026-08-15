@@ -504,10 +504,10 @@ console.log("\n[16] automation_key: валидный ключ исполняет
   // 17.2 Подтверждено «человеком» в середине окна (мок меняет статус на 2-й
   // опрос) — requireConsent возвращает готовый положительный результат
   // ОДНИМ вызовом, БЕЗ повторного исполнения (см. большой комментарий в
-  // consent.ts про двойное исполнение — намеренно НЕ kind:"confirmed",
-  // а kind:"refused" с положительным текстом: та же форма, что уже
-  // безусловно ретранслируют все ~25 вызывающих тулов, без риска повторно
-  // дёрнуть payload).
+  // consent.ts про двойное исполнение — намеренно НЕ kind:"confirmed", а
+  // отдельный kind:"already_executed" БЕЗ поля payload: повторить мутацию
+  // тулу физически нечем. До 2026-08-14 тот же исход ехал под kind:"refused",
+  // из-за чего модель получала машинный сигнал «отказ» на успех).
   {
     const store = makeStore();
     let polls = 0;
@@ -524,8 +524,10 @@ console.log("\n[16] automation_key: валидный ключ исполняет
     };
     const syncCfg = { ...cfg, syncWaitMs: 200, syncPollMs: 5 };
     const dec = await requireConsent({ tool: "drive_share", accountLabel: "personal", plan, rehash, store: flippingStore, cfg: syncCfg });
-    check("подтверждено в окне → kind=refused (положительная ретрансляция, НЕ повторное исполнение)", dec.kind === "refused", JSON.stringify(dec).slice(0, 120));
-    check("текст положительный (не 🛑)", dec.kind === "refused" && dec.result.includes("✅ Подтверждено и исполнено"));
+    check("подтверждено в окне → kind=already_executed (НЕ повторное исполнение)", dec.kind === "already_executed", JSON.stringify(dec).slice(0, 120));
+    check("это НЕ отказ — модель не должна видеть машинный «refused» на успехе", dec.kind !== "refused");
+    check("в исходе нет payload — повторить мутацию нечем", !("payload" in dec));
+    check("текст положительный (не 🛑)", dec.kind === "already_executed" && dec.report.includes("✅ Подтверждено и исполнено"));
     check("опрос остановился рано (не проболтался все 200мс)", polls < 40);
     check("манифест реально DONE в сторе (мутация «произошла» — консюм не наш)", [...store.manifests.values()][0].status === "DONE");
   }
@@ -596,9 +598,13 @@ console.log("\n[16] automation_key: валидный ключ исполняет
     const mismatchRehash = () => sha256({ changed: true });
     const syncCfg = { ...cfg, syncWaitMs: 200, syncPollMs: 5 };
     const dec = await requireConsent({ tool: "drive_share", accountLabel: "personal", plan, rehash: mismatchRehash, store: flippingStore, cfg: syncCfg });
-    check("binding-рассинхрон на sync-пути → refused (не тихое исполнение)", dec.kind === "refused", JSON.stringify(dec).slice(0, 120));
-    check("предупреждение о рассинхроне присутствует", dec.kind === "refused" && dec.result.toLowerCase().includes("измен"));
-    check("НЕ положительный «Подтверждено и исполнено» заголовок без оговорок", dec.kind === "refused" && !dec.result.includes("✅ Подтверждено и исполнено"));
+    // Мутацию всё равно УЖЕ исполнил другой канал — это не отказ, а отчёт с
+    // честной оговоркой, что мир с момента плана уехал. Повторного исполнения
+    // при этом быть не может: в исходе нет payload.
+    check("binding-рассинхрон на sync-пути → already_executed (не тихое повторное исполнение)", dec.kind === "already_executed", JSON.stringify(dec).slice(0, 120));
+    check("в исходе нет payload", !("payload" in dec));
+    check("предупреждение о рассинхроне присутствует", dec.kind === "already_executed" && dec.report.toLowerCase().includes("измен"));
+    check("НЕ положительный «Подтверждено и исполнено» заголовок без оговорок", dec.kind === "already_executed" && !dec.report.includes("✅ Подтверждено и исполнено"));
   }
 
   // 17.6 automation_key + sync одновременно: валидный ключ исполняет СРАЗУ,

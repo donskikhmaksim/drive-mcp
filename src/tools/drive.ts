@@ -6,7 +6,7 @@ import { z } from "zod";
 import { Readable } from "node:stream";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { ok, fail, guard, isTextual, safeText, mapWithLimit, humanReadableAutoExecuteReport } from "../util.js";
+import { ok, fail, guard, isTextual, safeText, mapWithLimit, humanReadableAutoExecuteReport, okExecutionReport } from "../util.js";
 import { accountField, type UserClients } from "../accounts.js";
 import type { GoogleClients } from "../google.js";
 import { documentToPlainText } from "./docs.js";
@@ -1812,6 +1812,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okExecutionReport(decision.report);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
@@ -1890,6 +1892,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okExecutionReport(decision.report);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
@@ -1980,6 +1984,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okExecutionReport(decision.report);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
@@ -2061,6 +2067,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okExecutionReport(decision.report);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
@@ -2161,6 +2169,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okExecutionReport(decision.report);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
@@ -2296,6 +2306,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okExecutionReport(decision.report);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
@@ -2571,6 +2583,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okExecutionReport(decision.report);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
@@ -2783,6 +2797,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okExecutionReport(decision.report);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
@@ -3028,6 +3044,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okExecutionReport(decision.report);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;
@@ -3114,6 +3132,8 @@ export function registerDriveTools(server: McpServer, clients: UserClients, ctx:
       });
 
       if (decision.kind === "planned") return ok(decision.preview);
+      // Исполнено другим каналом во время sync-wait — ОТЧЁТ, не отказ (см. consent.ts).
+      if (decision.kind === "already_executed") return okExecutionReport(decision.report);
       if (decision.kind === "refused") return ok(decision.result);
 
       const { payload, auditId } = decision;

@@ -17,6 +17,7 @@ import {
   invalidateManifest,
   appendConsentAudit,
   updateConsentAuditOutcome,
+  getConsentAuditByManifest,
   listConsentAudit,
   countConsentAudit,
   createTgApproval,
@@ -38,6 +39,10 @@ export const consentStoreAdapter: ConsentStore = {
   invalidateManifest,
   appendConsentAudit,
   updateConsentAuditOutcome,
+  // Опциональный read-метод контракта: даёт ветке `already_executed` в
+  // consent.ts вытащить ФАКТИЧЕСКИЙ исход мутации, которую исполнил веб-хаб
+  // или Telegram, — чтобы модель получала отчёт, а не «оно как-то исполнилось».
+  getAuditByManifest: getConsentAuditByManifest,
 };
 
 /**

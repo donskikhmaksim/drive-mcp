@@ -9,6 +9,39 @@ export function ok(data: unknown): CallToolResult {
   return { content: [{ type: "text", text }] };
 }
 
+/**
+ * Ключ пространства имён для НАШИХ метаданных ответа в MCP-поле `_meta`
+ * (спека MCP резервирует `_meta` под метаданные и требует префикс-namespace).
+ * Тот же namespace, что у соседних MCP-серверов Максима, — клиент разбирает
+ * его одинаково независимо от того, какой сервер ответил.
+ */
+export const PRESENTATION_META_KEY = "ru.donskikh.mcp/presentation";
+
+/** Что за текст лежит в `content[0].text` — для хоста, не для модели. */
+export type PresentationKind = "plan" | "execution-report" | "refusal";
+
+/**
+ * Ответ-ОТЧЁТ ОБ ИСПОЛНЕНИИ: текст сформирован сервером и не пересказывается,
+ * а машинная метка честно говорит, что действие СОСТОЯЛОСЬ.
+ *
+ * Зачем появилось (2026-08-14): у consent-гейта есть исход
+ * `already_executed` — «мутацию уже выполнил веб-хаб или Telegram, повторять
+ * не надо, вот что получилось». Отдавать его обычным `ok()` можно, но тогда у
+ * модели нет ни одного машинного признака, что это успешный исход, а не
+ * очередной промежуточный текст, — и она повторяет вызов (ровно этим
+ * закончилось в соседнем gmail-mcp, где там стояла прямая метка "refusal").
+ * Существующие ответы этим НЕ затрагиваются: функция применяется только на
+ * новой ветке.
+ */
+export function okExecutionReport(text: string): CallToolResult {
+  return {
+    content: [{ type: "text", text }],
+    _meta: {
+      [PRESENTATION_META_KEY]: { verbatim: true, kind: "execution-report" as PresentationKind },
+    },
+  };
+}
+
 export function fail(error: unknown): CallToolResult {
   const e = error as { message?: string; errors?: unknown; code?: unknown };
   const message =
