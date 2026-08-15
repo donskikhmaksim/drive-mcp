@@ -145,7 +145,28 @@ async function runAutoExecutePoller(config: Config): Promise<void> {
         consentServerConfig,
       );
       if (!result) continue; // гонка/дрейф/истёк — тихо пропускаем, это не ошибка
-      const reportText = await executor.execute(result.payload, result.auditId, { clients, consentStore: consentStoreAdapter });
+      let reportText: string;
+      try {
+        reportText = await executor.execute(result.payload, result.auditId, { clients, consentStore: consentStoreAdapter });
+      } catch (execErr) {
+        // Security-review 2026-08-14 (проблема №1, доп. дыра): манифест уже
+        // атомарно потреблён (`tryAutoExecute` выше), аудит-строка фазы 1 уже
+        // записана как `outcome:"confirmed"` (`appendConsentAudit` внутри
+        // `tryAutoExecute`, ДО мутации) — если `executor.execute` бросает
+        // исключение, БЕЗ этого перехвата `updateConsentAuditOutcome` вообще
+        // не вызывается, и `already_executed`-ветка (consent.ts) видит "нет
+        // пруфа, но и нет outcome:failed" — то есть НЕ отличает "провалилось"
+        // от "просто пруф ещё не подъехал". Дописываем реальный исход здесь,
+        // ПРЕЖДЕ чем прокинуть ошибку дальше — внешний catch ниже как и раньше
+        // логирует и пробует отчитаться в Telegram.
+        await consentStoreAdapter
+          .updateConsentAuditOutcome(result.auditId, {
+            outcome: "failed",
+            error: execErr instanceof Error ? execErr.message : String(execErr),
+          })
+          .catch(() => {});
+        throw execErr;
+      }
       await reportAutoExecutionResult(tgApprovalConfig, c.chatId, c.messageId, reportText);
     } catch (err) {
       console.error(`TG auto-execute: ошибка при исполнении ${c.tool}/${c.manifestId}:`, err);
@@ -349,7 +370,24 @@ export async function startHttpServer(config: Config): Promise<void> {
         res.status(409).json({ ok: false, error: "already_decided" });
         return;
       }
-      const reportText = await executor.execute(result.payload, result.auditId, execCtx);
+      let reportText: string;
+      try {
+        reportText = await executor.execute(result.payload, result.auditId, execCtx);
+      } catch (execErr) {
+        // Security-review 2026-08-14 (проблема №1, доп. дыра — тот же случай,
+        // что и в `runAutoExecutePoller`): манифест уже атомарно потреблён,
+        // аудит-строка фазы 1 уже "confirmed" без пруфа — без этого перехвата
+        // `updateConsentAuditOutcome` вообще не вызывается при исключении, и
+        // `already_executed`-ветка позже видит "нет пруфа" вместо честного
+        // "провалилось".
+        await consentStoreAdapter
+          .updateConsentAuditOutcome(result.auditId, {
+            outcome: "failed",
+            error: execErr instanceof Error ? execErr.message : String(execErr),
+          })
+          .catch(() => {});
+        throw execErr;
+      }
       res.json({ ok: true, outcome: "confirmed", result: reportText });
     } catch (err) {
       console.error(`POST /pending-consents/decide failed for manifest ${manifestId}:`, err);

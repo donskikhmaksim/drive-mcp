@@ -188,6 +188,30 @@ console.log("\n[2] исполнение упало на стороне внеш�
   check("kind=already_executed", dec.kind === "already_executed", dec.kind);
   check("ошибка исполнения попала в отчёт", dec.report.includes("403"), dec.report.slice(-300));
   check("нет payload", !("payload" in dec));
+  // Security-review 2026-08-14 (проблема №1): DONE = «манифест захвачен», а
+  // не «операция удалась» — заголовок и разрешающая формулировка ОБЯЗАНЫ
+  // смотреть на audit.outcome/error, а не только на binding. Воспроизведено
+  // проверяющим на моке gmail: раньше здесь всё равно рисовалось
+  // «### ✅ Подтверждено и исполнено».
+  check("заголовок НЕ рисует успех при провалившемся исполнении", !dec.report.includes("✅ Подтверждено и исполнено"), dec.report.slice(0, 60));
+  check("заголовок явно предупреждает (⚠️/🛑), не тихая галочка", /^### (⚠️|🛑)/.test(dec.report), dec.report.slice(0, 60));
+  check(
+    "текст требует проверить вручную, а НЕ безусловное «повторять не нужно»",
+    /проверь вручную/i.test(dec.report),
+    dec.report.slice(0, 600),
+  );
+}
+
+console.log("\n[2b] ошибка исполнения содержит URL с query (токен доступа) → в ответе модели query вырезан");
+{
+  const store = makeStore();
+  const wrapped = withExternalConfirm(store, {
+    error:
+      "fetch failed: https://storage.googleapis.com/bucket/report.pdf?X-Goog-Signature=SECRET123&X-Goog-Expires=900 responded 403",
+  });
+  const dec = await requireConsent({ tool: "drive_share", accountLabel: "personal", plan, rehash, store: wrapped, cfg: syncCfg });
+  check("query-параметр (токен доступа) вырезан из ответа модели", !dec.report.includes("SECRET123"), dec.report.slice(-500));
+  check("host+path URL остались читаемыми (не вся ссылка стёрта)", dec.report.includes("storage.googleapis.com/bucket/report.pdf"), dec.report.slice(-500));
 }
 
 console.log("\n[3] пруфа в аудите нет → честное «перепроверить не удалось», а не молчание");
@@ -252,6 +276,34 @@ console.log("\n[6] статика: каждый call site отдаёт already_e
   check("call site'ы найдены", sites > 0, sites);
   check(`все ${sites} call site'ов обрабатывают already_executed`, handled === sites, `${handled}/${sites}`);
   check("все отдают его через okExecutionReport (машинная метка исхода)", plainOk === 0, plainOk);
+}
+
+console.log("\n[7] _meta already_executed идёт под тем же неймспейсом ru.donskikh.mcp/presentation, что и остальные ответы");
+{
+  // Security-review 2026-08-14 (проблема №2): все call site'ы уже отдают
+  // already_executed через okExecutionReport() — тот же общий хелпер util.ts
+  // (с PRESENTATION_META_KEY), что и остальные ответы (проверено вручную: ни
+  // одного "сырого" `_meta:` мимо util.ts во всём src/). Тест закрепляет это
+  // структурно, чтобы регресс не проскочил незамеченным.
+  // dist/, не src/util.ts: util.ts делает относительный импорт "./consent.js"
+  // (NodeNext-резолв) — без `npm run build` .js рядом нет. `npm test` всегда
+  // гоняет `npm run build` первым шагом.
+  const { okExecutionReport, PRESENTATION_META_KEY } = await import("../dist/util.js");
+  const wrapped = okExecutionReport("тестовый отчёт");
+  check("_meta содержит ключ PRESENTATION_META_KEY (ru.donskikh.mcp/presentation)", !!wrapped._meta?.[PRESENTATION_META_KEY], JSON.stringify(wrapped._meta));
+  check("kind=execution-report", wrapped._meta?.[PRESENTATION_META_KEY]?.kind === "execution-report", wrapped._meta?.[PRESENTATION_META_KEY]?.kind);
+  check("verbatim=true (не пересказывать)", wrapped._meta?.[PRESENTATION_META_KEY]?.verbatim === true);
+
+  const files = readdirSync(new URL("../src/", import.meta.url), { recursive: true })
+    .filter((f) => typeof f === "string" && f.endsWith(".ts"))
+    .map((f) => "src/" + f);
+  let rawMeta = 0;
+  for (const f of files) {
+    if (f === "src/util.ts") continue;
+    const src = readFileSync(new URL("../" + f, import.meta.url), "utf8");
+    if (/_meta\s*:/.test(src) && !/PRESENTATION_META_KEY/.test(src)) rawMeta++;
+  }
+  check("нигде в src/ нет ручной сборки _meta мимо PRESENTATION_META_KEY", rawMeta === 0, rawMeta);
 }
 
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`}`);
